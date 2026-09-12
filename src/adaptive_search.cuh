@@ -2,10 +2,13 @@
 
 #include "adaptive_search_utils.cuh"
 
+/** SHAME(TALLFUNC) SHAME(MANYARG) */
+template <int CODEBITS, bool turboq>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedPrunedBeamSearch(
     int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
     const float* __restrict__ d_queries, const float* __restrict__ d_qg_data, const float* __restrict__ d_qg_signs,
+    const float* __restrict__ d_qg_levels,
     vidType* __restrict__ d_results, vidType entry_point,
     size_t row_offset, size_t neighbor_offset, size_t code_offset, size_t factor_offset,
     int max_iter_by_beam, float phase2_rho, bool use_ip)
@@ -42,7 +45,7 @@ void QuantizedPrunedBeamSearch(
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
     uint8_t* LUT_BUFFER = reinterpret_cast<uint8_t*>(ROTATED_QUERY_BUFFER + padded_dim);
-    char* query_factor_base = reinterpret_cast<char*>(LUT_BUFFER + (padded_dim << 2));
+    char* query_factor_base = reinterpret_cast<char*>(LUT_BUFFER + quant_lutbytes(padded_dim, CODEBITS));
     float* low_val = reinterpret_cast<float*>(query_factor_base);
     float* high_val = low_val + 1;
     float* width = high_val + 1;
@@ -118,8 +121,12 @@ void QuantizedPrunedBeamSearch(
     }
     __syncthreads();
 
-    // query preparation, quantize the query and prepare the RaBitQ LUT for fast neighbor estimation
-    query_prepare_lut_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
+    // query preparation, quantize the query and prepare the scan LUT for fast neighbor estimation
+    if constexpr (turboq) {
+        turboq_prepare_lut_gpu<CODEBITS>(QUERY_BUFFER, qf, d_qg_signs, d_qg_levels, dim, padded_dim);
+    } else {
+        query_prepare_lut_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
+    }
     __syncthreads();
 
     // loop end condition: either entire topK expanded, or reach max iteration
@@ -251,7 +258,7 @@ void QuantizedPrunedBeamSearch(
             if (!keep_all_valid) {
                 const float* parent_factors = parent_row + factor_offset;
                 const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(parent_row + code_offset);
-                const int bytes_per_neighbor = padded_dim >> 3;
+                const int bytes_per_neighbor = static_cast<int>(quant_bytes(padded_dim, CODEBITS));
                 constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
                 constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
                 const int group_lane = lane_id & (lanes_per_neighbor - 1);
@@ -265,7 +272,7 @@ void QuantizedPrunedBeamSearch(
                         const float* triple_x = parent_factors + i;
                         const float* factor_dq = parent_factors + max_degree + i;
                         const float* factor_vq = parent_factors + 2 * max_degree + i;
-                        est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor>(
+                        est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor, CODEBITS>(
                             qf, parent_code_base, i, triple_x, factor_dq, factor_vq,
                             PARENT_DISTANCE_LIST[0], padded_dim, bytes_per_neighbor);
                         valid_candidate = isfinite(est_dist);
@@ -343,7 +350,7 @@ void QuantizedPrunedBeamSearch(
                 }
             }
         } else {
-            const int bytes_per_neighbor = padded_dim >> 3;
+            const int bytes_per_neighbor = static_cast<int>(quant_bytes(padded_dim, CODEBITS));
             const int tiles_per_parent = (max_degree + WARP_SIZE - 1) / WARP_SIZE;
             const int task_count = static_cast<int>(keep_expanding) * tiles_per_parent;
 
@@ -390,7 +397,7 @@ void QuantizedPrunedBeamSearch(
                 // estimate candidates only when this tile needs pruning
                 DISTANCE_T est_dist = FLT_MAX;
                 if (!keep_all_valid && valid_candidate) {
-                    est_dist = scan_one_neighbor_lane_seq_lut_gpu(
+                    est_dist = scan_one_neighbor_lane_seq_lut_gpu<CODEBITS>(
                         qf, parent_code_base, static_cast<int>(neighbor_idx), triple_x, factor_dq, factor_vq,
                         PARENT_DISTANCE_LIST[parent_idx], padded_dim, bytes_per_neighbor);
                     valid_candidate = isfinite(est_dist);

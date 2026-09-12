@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "common.hpp"
+#include "quant.hpp"
 
 #define FULL_MASK 0xffffffff
 
@@ -942,11 +943,135 @@ static __device__ inline void query_prepare_lut_gpu(const float *query_raw, Quer
     }
 }
 
-template <int LANES_PER_NEIGHBOR>
+/**
+ * @brief Build the query lookup table for a TurboQuant level codebook.
+ *
+ * Groups QUANT_NIBBLE_DIMS / CODEBITS dimensions into one 4-bit scan code, most significant
+ * dimension first, matching pack_codes. Entries carry a gain of CODEBITS so that the widest
+ * group still fills the uint8 range, and sum_q carries the same gain, which lets the RaBitQ
+ * scan path consume the table without change.
+ *
+ * @tparam CODEBITS bits per dimension
+ * @param query_raw raw query vector
+ * @param scratch query factors, receives the rotated query, its range, and the table
+ * @param signs_ptr sign vector of the index rotation
+ * @param levels normalized reconstruction levels, 2^CODEBITS entries spanning [0, 1]
+ * @param dim raw dimension
+ * @param padded_dim padded dimension
+ */
+template <int CODEBITS>
+static __device__ inline void turboq_prepare_lut_gpu(
+    const float *query_raw, QueryFactors &scratch, const float *signs_ptr,
+    const float *levels, int dim, int padded_dim) { // SHAME(MANYARG) SHAME(TALLFUNC)
+    constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
+    constexpr int GROUP = QUANT_NIBBLE_DIMS / CODEBITS;
+    constexpr int LMASK = (1 << CODEBITS) - 1;
+
+    int tid = threadIdx.x;
+    int lane_id = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+
+    // [1] rotate the query with the same sign flip and transform the index used
+    rotate_vector_gpu(query_raw, scratch.rotated_query, signs_ptr, dim, padded_dim);
+    __syncthreads();
+
+    __shared__ float warp_min[WARPS_PER_BLOCK];
+    __shared__ float warp_max[WARPS_PER_BLOCK];
+    float local_min = FLT_MAX;
+    float local_max = -FLT_MAX;
+
+    // [2] reduce the rotated query range across the block
+    for (size_t i = tid; i < padded_dim; i += blockDim.x) {
+        float tmp = scratch.rotated_query[i];
+        local_min = fminf(local_min, tmp);
+        local_max = fmaxf(local_max, tmp);
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+        local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+    }
+
+    if (lane_id == 0) {
+        warp_min[warp_id] = local_min;
+        warp_max[warp_id] = local_max;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        local_min = (lane_id < WARPS_PER_BLOCK) ? warp_min[lane_id] : FLT_MAX;
+        local_max = (lane_id < WARPS_PER_BLOCK) ? warp_max[lane_id] : -FLT_MAX;
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+            local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+        }
+
+        if (lane_id == 0) {
+            scratch.low_val = local_min;
+            scratch.high_val = local_max;
+            const float query_span = scratch.high_val - scratch.low_val;
+            scratch.width = query_span * kQueryLevelsInv;
+        }
+    }
+    __syncthreads();
+
+    // [3] quantize the query and tabulate every 4-bit group code
+    const float inv_width = 1.0f / scratch.width;
+    __shared__ int32_t warp_sum[WARPS_PER_BLOCK];
+    int32_t local_sum = 0;
+    const int num_codebook = (padded_dim * CODEBITS) >> 2;
+
+    for (int cb = tid; cb < num_codebook; cb += blockDim.x) {
+        float q[GROUP];
+#pragma unroll
+        for (int j = 0; j < GROUP; ++j) {
+            const int idx = cb * GROUP + j;
+            const float scaled = ((scratch.rotated_query[idx] - scratch.low_val) * inv_width) + 0.5f;
+            const int level = static_cast<int>(lroundf(scaled));
+            q[j] = static_cast<float>(level);
+            local_sum += level;
+        }
+
+        uint8_t *lut_chunk = scratch.lut + (cb << 4);
+        for (int code = 0; code < 16; ++code) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < GROUP; ++j) {
+                constexpr int base_shift = QUANT_NIBBLE_DIMS;
+                const int shift = base_shift - (j + 1) * CODEBITS;
+                acc += q[j] * levels[(code >> shift) & LMASK];
+            }
+            lut_chunk[code] = static_cast<uint8_t>(lroundf(acc * static_cast<float>(CODEBITS)));
+        }
+    }
+
+    // [4] reduce the gain-scaled query sum used by the scan correction
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+    }
+
+    if (lane_id == 0) {
+        warp_sum[warp_id] = local_sum;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        local_sum = (lane_id < WARPS_PER_BLOCK) ? warp_sum[lane_id] : 0;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+        }
+        if (lane_id == 0) {
+            scratch.sum_q = local_sum * CODEBITS;
+        }
+    }
+}
+
+template <int LANES_PER_NEIGHBOR, int CODEBITS = 1>
 static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
     const QueryFactors &qf, const uint8_t *packed_codes_block, int neighbor_idx,
     const float *triple_x, const float *factor_dq, const float *factor_vq,
-    float exact_dist, int padded_dim, int bytes_per_neighbor) {
+    float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
     static_assert(LANES_PER_NEIGHBOR == 2 || LANES_PER_NEIGHBOR == 4 ||
                       LANES_PER_NEIGHBOR == 8 || LANES_PER_NEIGHBOR == 16 ||
                       LANES_PER_NEIGHBOR == 32,
@@ -963,7 +1088,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
         constexpr unsigned group_bits = (1u << LANES_PER_NEIGHBOR) - 1u;
         group_mask = group_bits << group_start;
     }
-    const int num_codebook = padded_dim >> 2;
+    const int num_codebook = (padded_dim * CODEBITS) >> 2;
     uint32_t local_raw_sum = 0;
 
     constexpr int lut_layout_neighbors = WARP_SIZE / GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES;
@@ -997,10 +1122,11 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
     return est_dist;
 }
 
+template <int CODEBITS = 1>
 static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     const QueryFactors &qf, const uint8_t *parent_code_base, int neighbor_idx,
     float triple_x, float factor_dq, float factor_vq,
-    float exact_dist, int padded_dim, int bytes_per_neighbor) {
+    float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
     if (triple_x == FLT_MAX)
         return FLT_MAX;
 
@@ -1015,7 +1141,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
         seq_lut_tile = parent_code_base + tile_idx * lut_layout_neighbors * bytes_per_neighbor;
     }
 
-    const int num_codebook = padded_dim >> 2;
+    const int num_codebook = (padded_dim * CODEBITS) >> 2;
     uint32_t raw_sum = 0;
     for (int cb = 0; cb < num_codebook; ++cb) {
         const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(

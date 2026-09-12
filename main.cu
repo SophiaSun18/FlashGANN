@@ -6,11 +6,13 @@
 #include "include/data_io.hpp"
 #include "include/metric.hpp"
 #include "include/qg.hpp"
+#include "include/quant.hpp"
 #include "include/common.hpp"
 
+/** SHAME(TALLFUNC) */
 int main(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-csv output.csv]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv]\n", argv[0]);
         return 1;
     }
 
@@ -22,6 +24,7 @@ int main(int argc, char** argv) {
     int K = 100;
     int beam_size = 128;
     int degree = 32;
+    int code_bits = 1;
     std::string csv_file;
 
     int arg_idx = 5;
@@ -32,6 +35,10 @@ int main(int argc, char** argv) {
         std::string arg = argv[arg_idx];
         if (arg == "-csv" && arg_idx + 1 < argc) {
             csv_file = argv[++arg_idx];
+        } else if (arg == "-quant" && arg_idx + 1 < argc) {
+            g_quant_type = quant_parse(argv[++arg_idx]);
+        } else if (arg == "-bits" && arg_idx + 1 < argc) {
+            code_bits = atoi(argv[++arg_idx]);
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return 1;
@@ -48,6 +55,7 @@ int main(int argc, char** argv) {
     printf("K: %d\n", K);
     printf("Beam size: %d\n", beam_size);
     printf("Degree: %d\n", degree);
+    printf("Quantizer: %s, bits: %d\n", quant_name(g_quant_type), code_bits);
     if (!csv_file.empty()) printf("CSV output: %s\n", csv_file.c_str());
 
     g_metric_type = infer_metric_from_dataset_path(data_file);
@@ -76,7 +84,7 @@ int main(int argc, char** argv) {
 
     std::vector<vidType> results(nq * K);
     double elapsed = 0.0;
-    QuantizationGraph qg(base.count, base.dim, degree, qg_codebook);
+    QuantizationGraph qg(base.count, base.dim, degree, qg_codebook, g_quant_type, code_bits);
     qg.set_metric(g_metric_type);
     qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(),
                            beam_size, elapsed);
