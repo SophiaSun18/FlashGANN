@@ -19,7 +19,9 @@ public:
                       QuantType quant, int bits)
         : num_nodes_(num_node), dim_(dim), degree_(degree), quant_type_(quant), code_bits_(bits) {
 
-        if (!quant_valid(code_bits_)) throw std::runtime_error("Unsupported quantizer bit width");
+        if (!quant_supported(quant_type_, code_bits_)) {
+            throw std::runtime_error("Unsupported quantizer bit width");
+        }
         init_layout();
 
         std::ifstream fin(codebook_path, std::ios::binary);
@@ -50,21 +52,26 @@ public:
     ~QuantizationGraph() {
         free(data_);
         free(signs_ptr_);
+        free(sketch_ptr_);
         free(level_ptr_);
     }
 
     inline const float* get_data_ptr() const { return data_; }
     inline const float* get_signs_ptr() const { return signs_ptr_; }
+    inline const float* get_sketch_ptr() const { return sketch_ptr_; }
     inline const float* get_level_ptr() const { return level_ptr_; }
     inline size_t get_data_bytes() const { return num_nodes_ * row_offset_ * sizeof(float); }
     inline size_t get_signs_bytes() const { return padded_dim_ * sizeof(float); }
+    inline size_t get_sketch_bytes() const { return sketch_words_ * sizeof(float); }
     inline size_t get_level_bytes() const { return num_levels_ * sizeof(float); }
+    inline float get_kappa() const { return kappa_; }
     inline MetricType get_metric() const { return metric_; }
     inline void set_metric(MetricType metric) { metric_ = metric; }
     inline QuantType get_quant() const { return quant_type_; }
     inline int get_bits() const { return code_bits_; }
 
     inline size_t get_code_offset() const { return code_offset_; }
+    inline size_t get_sign_offset() const { return sign_offset_; }
     inline size_t get_factor_offset() const { return factor_offset_; }
     inline size_t get_neighbor_offset() const { return neighbor_offset_; }
     inline size_t get_row_offset() const { return row_offset_; }
@@ -75,11 +82,14 @@ public:
 
 private:
     void init_layout() {
+        const bool prod = quant_type_ == QUANT_TBQ;
         padded_dim_ = 1ULL << static_cast<size_t>(ceil(log2(dim_)));
-        bitcode_words_ = quant_words(padded_dim_, code_bits_);
+        bitcode_words_ = quant_words(padded_dim_, prod ? quant_stage(code_bits_) : code_bits_);
+        signcode_words_ = prod ? quant_words(padded_dim_, 1) : 0;
         code_offset_ = dim_;
-        factor_offset_ = code_offset_ + bitcode_words_ * degree_;
-        neighbor_offset_ = factor_offset_ + 3 * degree_;
+        sign_offset_ = code_offset_ + bitcode_words_ * degree_;
+        factor_offset_ = sign_offset_ + signcode_words_ * degree_;
+        neighbor_offset_ = factor_offset_ + quant_factors(quant_type_) * degree_;
         row_offset_ = neighbor_offset_ + degree_;
     }
 
@@ -99,28 +109,42 @@ private:
         }
 
         num_levels_ = static_cast<size_t>(nlevel);
-        if (num_levels_ == 0) return;
-        if (num_levels_ != (1u << code_bits_)) throw std::runtime_error("Level count mismatch: " + path);
-        level_ptr_ = static_cast<float*>(aligned_alloc(64, ((num_levels_ * sizeof(float) + 63) / 64) * 64));
-        fin.read(reinterpret_cast<char*>(level_ptr_), sizeof(float) * num_levels_);
-        if (!fin) throw std::runtime_error("Truncated level table in codebook: " + path);
+        if (num_levels_ > 0) {
+            if (num_levels_ != (1u << quant_stage(code_bits_))) {
+                throw std::runtime_error("Level count mismatch: " + path);
+            }
+            level_ptr_ = static_cast<float*>(aligned_alloc(64, ((num_levels_ * sizeof(float) + 63) / 64) * 64));
+            fin.read(reinterpret_cast<char*>(level_ptr_), sizeof(float) * num_levels_);
+        }
+
+        if (quant_type_ != QUANT_TBQ) return;
+        fin.read(reinterpret_cast<char*>(&kappa_), sizeof(float));
+        sketch_words_ = 3 * padded_dim_;
+        sketch_ptr_ = static_cast<float*>(aligned_alloc(64, ((sketch_words_ * sizeof(float) + 63) / 64) * 64));
+        fin.read(reinterpret_cast<char*>(sketch_ptr_), sizeof(float) * sketch_words_);
+        if (!fin) throw std::runtime_error("Truncated sketch in codebook: " + path);
     }
 
     size_t num_nodes_;
     size_t dim_, padded_dim_;
     int degree_;
     size_t bitcode_words_;
+    size_t signcode_words_ = 0;
     vidType entry_point_;
-    
+
     // QG-style offsets (in units of float)
     size_t code_offset_;
+    size_t sign_offset_;
     size_t factor_offset_;
     size_t neighbor_offset_;
     size_t row_offset_;
     float* data_ = nullptr;
     float* signs_ptr_ = nullptr;
+    float* sketch_ptr_ = nullptr;
     float* level_ptr_ = nullptr;
     size_t num_levels_ = 0;
+    size_t sketch_words_ = 0;
+    float kappa_ = 1.0f;
     QuantType quant_type_ = QUANT_RBQ;
     int code_bits_ = 1;
     MetricType metric_ = METRIC_L2;

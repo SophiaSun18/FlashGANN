@@ -28,7 +28,8 @@ BUILD_HEADERS := \
 	include/metric.hpp \
 	include/pack.hpp \
 	include/quant.hpp \
-	include/rotator.hpp
+	include/rotator.hpp \
+	include/sketch.hpp
 
 .PHONY: all clean
 

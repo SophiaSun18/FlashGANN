@@ -11,19 +11,23 @@
 #include "src/adaptive_search.cuh"
 
 typedef void (*SearchKernel)(int, int, int, int, int, int, size_t,
-                             const float*, const float*, const float*, const float*,
-                             vidType*, vidType, size_t, size_t, size_t, size_t,
+                             const float*, const float*, const float*, const float*, const float*,
+                             vidType*, vidType, size_t, size_t, size_t, size_t, size_t,
                              int, float, bool);
 
 /**
  * @brief Pick the beam search instantiation matching the index quantizer.
+ *
+ * For the TurboQuant path the template width is the MSE stage, one bit narrower than the
+ * total, since the remaining bit is spent on the QJL sign block.
+ *
  * @param quant quantizer family
- * @param bits bits per dimension
+ * @param bits total bits per dimension
  * @return kernel pointer, or nullptr when the combination is unsupported
  */
 static SearchKernel select_kernel(QuantType quant, int bits) {
     if (quant == QUANT_TBQ) {
-        switch (bits) {
+        switch (quant_stage(bits)) {
             case 1: return QuantizedPrunedBeamSearch<1, true>;
             case 2: return QuantizedPrunedBeamSearch<2, true>;
             case 4: return QuantizedPrunedBeamSearch<4, true>;
@@ -71,6 +75,7 @@ void QuantizationGraph::gpu_search_adaptive(
     float *d_qg_data = nullptr;
     float *d_qg_signs = nullptr;
     float *d_qg_levels = nullptr;
+    float *d_qg_sketch = nullptr;
     vidType *d_results = nullptr;
     size_t free_mem_bytes = 0;
     size_t total_mem_bytes = 0;
@@ -104,6 +109,11 @@ void QuantizationGraph::gpu_search_adaptive(
         CUDA_SAFE_CALL(cudaMemcpy(d_qg_levels, this->get_level_ptr(), this->get_level_bytes(),
                                   cudaMemcpyHostToDevice));
     }
+    if (this->get_sketch_bytes() > 0) {
+        CUDA_SAFE_CALL(cudaMalloc((void **)&d_qg_sketch, this->get_sketch_bytes()));
+        CUDA_SAFE_CALL(cudaMemcpy(d_qg_sketch, this->get_sketch_ptr(), this->get_sketch_bytes(),
+                                  cudaMemcpyHostToDevice));
+    }
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_results, results_bytes));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -115,7 +125,7 @@ void QuantizationGraph::gpu_search_adaptive(
 
     uint32_t shm_size = calculate_shared_mem_size(
         static_cast<int>(this->dim_), padded_beam_size, static_cast<int>(this->degree_), bitlen,
-        this->get_bits());
+        this->get_bits(), this->get_quant());
     printf("Dynamic shared memory size = %u bytes\n", shm_size);
     CUDA_SAFE_CALL(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -135,9 +145,10 @@ void QuantizationGraph::gpu_search_adaptive(
     auto start = std::chrono::high_resolution_clock::now();
     kernel<<<num_blocks, num_threads, shm_size>>>(
         K, nq, static_cast<int>(this->dim_), beam_sz, bitlen, static_cast<int>(this->degree_),
-        this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_levels, d_results,
+        this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_sketch, d_qg_levels, d_results,
         entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset(), max_iter_by_beam, phase2_rho, this->get_metric() == METRIC_IP);
+        this->get_code_offset(), this->get_sign_offset(), this->get_factor_offset(),
+        max_iter_by_beam, phase2_rho, this->get_metric() == METRIC_IP);
     CUDA_SAFE_CALL(cudaGetLastError());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
@@ -148,5 +159,6 @@ void QuantizationGraph::gpu_search_adaptive(
     CUDA_SAFE_CALL(cudaFree(d_qg_data));
     CUDA_SAFE_CALL(cudaFree(d_qg_signs));
     if (d_qg_levels != nullptr) CUDA_SAFE_CALL(cudaFree(d_qg_levels));
+    if (d_qg_sketch != nullptr) CUDA_SAFE_CALL(cudaFree(d_qg_sketch));
     CUDA_SAFE_CALL(cudaFree(d_results));
 }
