@@ -10,13 +10,16 @@
 
 #include "common.hpp"
 #include "metric.hpp"
+#include "quant.hpp"
 
 class QuantizationGraph {
 public:
     // Codebook layout: entry point followed by per-node raw vector, packed codes, factors, and neighbor IDs.
-    QuantizationGraph(size_t num_node, size_t dim, int degree, const std::string& codebook_path)
-        : num_nodes_(num_node), dim_(dim), degree_(degree) {
+    QuantizationGraph(size_t num_node, size_t dim, int degree, const std::string& codebook_path,
+                      QuantType quant, int bits)
+        : num_nodes_(num_node), dim_(dim), degree_(degree), quant_type_(quant), code_bits_(bits) {
 
+        if (!quant_valid(code_bits_)) throw std::runtime_error("Unsupported quantizer bit width");
         init_layout();
 
         std::ifstream fin(codebook_path, std::ios::binary);
@@ -35,23 +38,31 @@ public:
         signs_ptr_ = static_cast<float*>(aligned_alloc(64, padded_dim_ * sizeof(float)));
         fin.read(reinterpret_cast<char*>(signs_ptr_), padded_dim_ * sizeof(float));
 
+        read_quant_tail(fin, codebook_path);
         fin.close();
 
-        printf("Loaded codebook: %zu nodes, dim=%zu, degree=%d, padded_dim=%zu, row_offset=%zu floats (entry_point=%u)\n",
-               num_nodes_, dim_, degree_, padded_dim_, row_offset_, entry_point_);
+        printf("Loaded codebook: %zu nodes, dim=%zu, degree=%d, padded_dim=%zu, row_offset=%zu floats "
+               "(entry_point=%u, quant=%s, bits=%d)\n",
+               num_nodes_, dim_, degree_, padded_dim_, row_offset_, entry_point_,
+               quant_name(quant_type_), code_bits_);
     }
 
     ~QuantizationGraph() {
         free(data_);
         free(signs_ptr_);
+        free(level_ptr_);
     }
 
     inline const float* get_data_ptr() const { return data_; }
     inline const float* get_signs_ptr() const { return signs_ptr_; }
+    inline const float* get_level_ptr() const { return level_ptr_; }
     inline size_t get_data_bytes() const { return num_nodes_ * row_offset_ * sizeof(float); }
     inline size_t get_signs_bytes() const { return padded_dim_ * sizeof(float); }
+    inline size_t get_level_bytes() const { return num_levels_ * sizeof(float); }
     inline MetricType get_metric() const { return metric_; }
     inline void set_metric(MetricType metric) { metric_ = metric; }
+    inline QuantType get_quant() const { return quant_type_; }
+    inline int get_bits() const { return code_bits_; }
 
     inline size_t get_code_offset() const { return code_offset_; }
     inline size_t get_factor_offset() const { return factor_offset_; }
@@ -65,11 +76,34 @@ public:
 private:
     void init_layout() {
         padded_dim_ = 1ULL << static_cast<size_t>(ceil(log2(dim_)));
-        bitcode_words_ = padded_dim_ / 64;
+        bitcode_words_ = quant_words(padded_dim_, code_bits_);
         code_offset_ = dim_;
-        factor_offset_ = code_offset_ + bitcode_words_ * 2 * degree_;
+        factor_offset_ = code_offset_ + bitcode_words_ * degree_;
         neighbor_offset_ = factor_offset_ + 3 * degree_;
         row_offset_ = neighbor_offset_ + degree_;
+    }
+
+    /**
+     * @brief Read the quantizer descriptor appended after the sign vector.
+     * @param fin open index stream positioned at the tail
+     * @param path index path, used for error messages
+     */
+    void read_quant_tail(std::ifstream& fin, const std::string& path) {
+        int32_t qtag = 0, qbits = 0, nlevel = 0;
+        fin.read(reinterpret_cast<char*>(&qtag), sizeof(int32_t));
+        fin.read(reinterpret_cast<char*>(&qbits), sizeof(int32_t));
+        fin.read(reinterpret_cast<char*>(&nlevel), sizeof(int32_t));
+        if (!fin) throw std::runtime_error("Missing quantizer tail in codebook: " + path);
+        if (qtag != static_cast<int32_t>(quant_type_) || qbits != code_bits_) {
+            throw std::runtime_error("Codebook quantizer does not match the requested one: " + path);
+        }
+
+        num_levels_ = static_cast<size_t>(nlevel);
+        if (num_levels_ == 0) return;
+        if (num_levels_ != (1u << code_bits_)) throw std::runtime_error("Level count mismatch: " + path);
+        level_ptr_ = static_cast<float*>(aligned_alloc(64, ((num_levels_ * sizeof(float) + 63) / 64) * 64));
+        fin.read(reinterpret_cast<char*>(level_ptr_), sizeof(float) * num_levels_);
+        if (!fin) throw std::runtime_error("Truncated level table in codebook: " + path);
     }
 
     size_t num_nodes_;
@@ -85,5 +119,9 @@ private:
     size_t row_offset_;
     float* data_ = nullptr;
     float* signs_ptr_ = nullptr;
+    float* level_ptr_ = nullptr;
+    size_t num_levels_ = 0;
+    QuantType quant_type_ = QUANT_RBQ;
+    int code_bits_ = 1;
     MetricType metric_ = METRIC_L2;
 };
