@@ -744,7 +744,11 @@ __device__ inline void hashtable_restore(
     if (threadIdx.x < first_tid)
         return;
     for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
-        auto key = itopk_indices[i] & ~index_msb_1_mask; // clear most significant bit
+        const auto raw_key = itopk_indices[i];
+        if (raw_key == MAX_INDEX) {
+            continue;
+        }
+        auto key = raw_key & ~index_msb_1_mask; // clear most significant bit
         hashtable_insert(table, BITLEN, key);
     }
 }

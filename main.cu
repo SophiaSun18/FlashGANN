@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(),
                            beam_size, elapsed);
 
-    const float recall = compute_recall(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
+    const float recall = compute_recall_dedup(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
     const double latency_ms = (nq > 0) ? (elapsed * 1000.0 / static_cast<double>(nq)) : 0.0;
     const double qps = (elapsed > 0.0) ? (static_cast<double>(nq) / elapsed) : 0.0;
 

@@ -125,17 +125,12 @@ void QuantizedPrunedBeamSearch(
     // loop end condition: either entire topK expanded, or reach max iteration
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
-        // periodically rebuild the small visited set
-        if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-            hashtable_init(HASH_TABLE, bitlen);
-            __syncthreads();
-            hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
-        }
-        __syncthreads();
-
         if (iter >= max_iter_by_beam) {
             break;
         }
+
+        // periodically reset the hash table
+        const bool reset_hash = ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0);
 
         // sort and merge existing candidates into the beam
         const uint32_t merge_candidate_count = candidate_buffer_size;
@@ -157,6 +152,12 @@ void QuantizedPrunedBeamSearch(
             PARENT_NODE_LIST[i] = MAX_INDEX;
             PARENT_DISTANCE_LIST[i] = FLT_MAX;
         }
+        if (reset_hash) {
+            hashtable_init(HASH_TABLE, bitlen);
+            __syncthreads();
+            hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
+        }
+        __syncthreads();
         if (tid == 0) {
             compact_candidate_count = 0;
             current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
@@ -451,15 +452,25 @@ void QuantizedPrunedBeamSearch(
         candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
+    hashtable_init(HASH_TABLE, bitlen);
+    __syncthreads();
+
     // write top-k results
     if (tid == 0) {
-        INDEX_T last_result = 0;
-        for (int i = 0; i < K; ++i) {
-            INDEX_T result = (i < beam_sz) ? (TOP_K_INDEX[i] & 0x7fffffffu) : MAX_INDEX;
-            if (result != MAX_INDEX) {
-                last_result = result;
+        int output_count = 0;
+        for (int i = 0; i < beam_sz && output_count < K; ++i) {
+            const INDEX_T raw_result = TOP_K_INDEX[i];
+            if (raw_result == MAX_INDEX) {
+                continue;
             }
-            d_results[query_id * K + i] = (result == MAX_INDEX) ? last_result : result;
+            const INDEX_T result = raw_result & 0x7fffffffu;
+            if (hashtable_insert(HASH_TABLE, bitlen, result)) {
+                d_results[query_id * K + output_count] = result;
+                ++output_count;
+            }
+        }
+        for (int i = output_count; i < K; ++i) {
+            d_results[query_id * K + i] = MAX_INDEX;
         }
     }
 
