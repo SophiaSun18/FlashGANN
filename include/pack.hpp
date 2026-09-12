@@ -60,14 +60,24 @@ inline void read_levels(const std::string& path, int bits, std::vector<float>& l
 
 /**
  * @brief Quantize one coordinate against an ascending level table.
+ *
+ * Binary searches the 2^bits - 1 midpoints separating adjacent levels, so the cost is
+ * logarithmic in the table size rather than linear.
+ *
  * @param levels ascending reconstruction levels
  * @param value coordinate of a unit-norm rotated residual
  * @return index of the nearest level
  */
 inline uint8_t quantize_level(const std::vector<float>& levels, float value) {
-    size_t best = 0;
-    for (size_t k = 1; k < levels.size(); ++k) {
-        if (value >= 0.5f * (levels[k - 1] + levels[k])) best = k;
+    size_t lo = 0;
+    size_t hi = levels.size() - 1;
+    while (lo < hi) {
+        const size_t mid = (lo + hi + 1) >> 1;
+        if (value >= 0.5f * (levels[mid - 1] + levels[mid])) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
-    return static_cast<uint8_t>(best);
+    return static_cast<uint8_t>(lo);
 }
