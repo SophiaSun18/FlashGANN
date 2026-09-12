@@ -1081,7 +1081,7 @@ static __device__ inline void lut_build(QueryFactors &scratch, const float *leve
         for (int j = 0; j < GROUP; ++j) {
             const int idx = cb * GROUP + j;
             const float scaled = ((scratch.rotated_query[idx] - scratch.low_val) * inv_width) + 0.5f;
-            const int level = static_cast<int>(lroundf(scaled));
+            const int level = static_cast<int>(scaled);
             q[j] = static_cast<float>(level);
             local_sum += level;
         }

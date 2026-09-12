@@ -10,20 +10,11 @@
 
 #include "../include/common.hpp"
 #include "../include/data_io.hpp"
+#include "../include/encode.hpp"
 #include "../include/pack.hpp"
 #include "../include/quant.hpp"
 #include "../include/rotator.hpp"
 #include "../include/sketch.hpp"
-
-/** @brief Shape of the index being emitted. */
-struct BuildSpec {
-    size_t numnode;
-    size_t rawdim;
-    size_t paddim;
-    int degree;
-    int codebit;
-    QuantType qtype;
-};
 
 /**
  * @brief Float offsets of the interleaved row layout consumed by QuantizationGraph.
@@ -113,146 +104,6 @@ static void encode_rbq(const BuildSpec& spec, const float* rotu, const float* ro
 }
 
 /**
- * @brief Encode one parent's neighbor list with a TurboQuant level table.
- * @param spec index shape
- * @param rotu rotated parent vector
- * @param rotv rotated neighbor vectors, degree by paddim
- * @param levels ascending reconstruction levels of the unit-norm residual
- * @param codes scratch of paddim per-dimension codes
- * @param row destination row, positioned at the parent
- * @param codeoff packed code offset within the row
- * @param facoff factor block offset within the row
- */
-static void encode_tbq(const BuildSpec& spec, const FastfoodSketch& sketch, float kappa,
-                       const float* rotu, const float* sku, const float* rotv,
-                       const std::vector<float>& levels, uint8_t* codes, uint8_t* signs,
-                       float* resid, float* proj, float* row,
-                       size_t codeoff, size_t signoff, size_t facoff) { // SHAME(MANYARG) SHAME(TALLFUNC)
-    const int stage = quant_stage(spec.codebit);
-    const size_t words = quant_words(spec.paddim, stage);
-    const size_t swords = quant_words(spec.paddim, 1);
-    const float crange = levels.back() - levels.front();
-    const float fhtfix = 1.0f / std::sqrt(static_cast<float>(spec.paddim));
-    const float gain = static_cast<float>(stage);
-    const int deg = spec.degree;
-
-    for (int j = 0; j < deg; ++j) {
-        const float* vec = rotv + static_cast<size_t>(j) * spec.paddim;
-
-        // [1] residual against the parent and its norm
-        float normsq = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            resid[k] = vec[k] - rotu[k];
-            normsq += resid[k] * resid[k];
-        }
-        const float xnorm = std::sqrt(normsq);
-        const float inv = (xnorm > 0.0f) ? (1.0f / xnorm) : 0.0f;
-
-        // [2] MSE stage over the unit residual
-        float sumhat = 0.0f, ipu = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            codes[k] = quantize_level(levels, resid[k] * inv);
-            const float hat = levels[codes[k]];
-            sumhat += hat;
-            ipu += rotu[k] * hat;
-            resid[k] -= xnorm * hat;
-        }
-
-        // [3] QJL sign stage over what the MSE stage left behind
-        float mnorm = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) mnorm += resid[k] * resid[k];
-        mnorm = std::sqrt(mnorm);
-        sketch.apply(resid, proj);
-
-        float sumsig = 0.0f, ipsk = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            const float s = (proj[k] > 0.0f) ? 1.0f : -1.0f;
-            signs[k] = (proj[k] > 0.0f) ? 1 : 0;
-            sumsig += s;
-            ipsk += sku[k] * s;
-        }
-
-        // the search sketches the unnormalized rotated query, so both query-side QJL
-        // coefficients carry the same 1/sqrt(paddim) the MSE stage coefficients do
-        const float qscale = kappa * mnorm;
-        row[facoff + j] = xnorm * xnorm + 2.0f * xnorm * ipu + 2.0f * qscale * ipsk;
-        row[facoff + deg + j] = -xnorm * crange * fhtfix / gain;
-        row[facoff + 2 * deg + j] = -2.0f * xnorm * sumhat * fhtfix;
-        row[facoff + 3 * deg + j] = -2.0f * qscale * fhtfix;
-        row[facoff + 4 * deg + j] = -2.0f * qscale * sumsig * fhtfix;
-
-        pack_codes(spec.paddim, stage, codes,
-                   reinterpret_cast<uint8_t*>(row + codeoff + static_cast<size_t>(j) * words));
-        pack_codes(spec.paddim, 1, signs,
-                   reinterpret_cast<uint8_t*>(row + signoff + static_cast<size_t>(j) * swords));
-    }
-}
-
-/**
- * @brief Fit the QJL scale that makes the sign estimator match exact inner products.
- *
- * The sqrt(pi/2)/d constant assumes exactly Gaussian rows, which the Fastfood sketch only
- * approximates, so the scale is least-squares fitted on sampled residuals against random
- * query directions.
- *
- * @param spec index shape
- * @param sketch the sketch the index will store
- * @param levels MSE stage reconstruction levels
- * @param rotated rotated base vectors
- * @param edges adjacency, numnode by degree
- * @param samples number of parent nodes to draw
- * @return the fitted scale
- */
-static float calibrate_kappa(const BuildSpec& spec, const FastfoodSketch& sketch,
-                             const std::vector<float>& levels, const float* rotated,
-                             const std::vector<uint32_t>& edges, size_t samples) { // SHAME(MANYARG)
-    std::mt19937 gen(20260912u);
-    std::uniform_int_distribution<size_t> pick(0, spec.numnode - 1);
-    std::normal_distribution<float> gauss(0.0f, 1.0f);
-
-    std::vector<float> resid(spec.paddim), proj(spec.paddim), query(spec.paddim), skq(spec.paddim);
-    double num = 0.0, den = 0.0;
-
-    for (size_t t = 0; t < samples; ++t) {
-        const size_t u = pick(gen);
-        const uint32_t v = edges[u * static_cast<size_t>(spec.degree) + (t % spec.degree)];
-        const float* rotu = rotated + u * spec.paddim;
-        const float* rotv = rotated + static_cast<size_t>(v) * spec.paddim;
-
-        float normsq = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            resid[k] = rotv[k] - rotu[k];
-            normsq += resid[k] * resid[k];
-        }
-        const float xnorm = std::sqrt(normsq);
-        if (xnorm <= 0.0f) continue;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            resid[k] -= xnorm * levels[quantize_level(levels, resid[k] / xnorm)];
-        }
-
-        float mnorm = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) mnorm += resid[k] * resid[k];
-        mnorm = std::sqrt(mnorm);
-        if (mnorm <= 0.0f) continue;
-
-        sketch.apply(resid.data(), proj.data());
-        for (size_t k = 0; k < spec.paddim; ++k) query[k] = gauss(gen);
-        sketch.apply(query.data(), skq.data());
-
-        double exact = 0.0, sign_ip = 0.0;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            exact += static_cast<double>(query[k]) * resid[k];
-            sign_ip += static_cast<double>(skq[k]) * ((proj[k] > 0.0f) ? 1.0 : -1.0);
-        }
-        const double b = mnorm * sign_ip;
-        num += exact * b;
-        den += b * b;
-    }
-
-    return (den > 0.0) ? static_cast<float>(num / den) : 1.0f;
-}
-
-/**
  * @brief Write the interleaved index plus its sign vector and quantizer tail.
  * @param path destination file
  * @param spec index shape
@@ -319,7 +170,7 @@ int main(int argc, char** argv) {
 
     FhtRotator rotator(spec.rawdim, seed);
     spec.paddim = rotator.get_paddim();
-    FastfoodSketch sketch(spec.rawdim, seed + 104729u);
+    FastfoodSketch sketch(spec.paddim, seed + 104729u);
 
     std::vector<float> levels;
     if (qtype == QUANT_TBQ) {
@@ -345,12 +196,7 @@ int main(int argc, char** argv) {
         rotator.rotate(base.values.data() + u * spec.rawdim, rotated.data() + u * spec.paddim);
     }
 
-    float kappa = 1.0f;
-    if (qtype == QUANT_TBQ) {
-        printf("Calibrating QJL scale...\n");
-        kappa = calibrate_kappa(spec, sketch, levels, rotated.data(), edges, 20000);
-        printf("kappa = %.8f\n", kappa);
-    }
+    const float kappa = FastfoodSketch::get_scale(spec.paddim);
 
     printf("Encoding neighbor codes...\n");
     std::vector<float> rows(spec.numnode * rowoff, 0.0f);

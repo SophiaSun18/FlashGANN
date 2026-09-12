@@ -7,13 +7,11 @@
 #include <vector>
 
 /**
- * @brief Fastfood approximation of a dense Gaussian sketch.
+ * @brief Fastfood sketch S = H flipu spectr H flipv with normalized Walsh-Hadamard H.
  *
- * A square Gaussian factors as U * Sigma * V^T with Haar orthogonal U and V and singular
- * values following the Marchenko-Pastur quarter circle. Replacing both orthogonal factors
- * with a random sign flip followed by a Walsh-Hadamard transform keeps the spectrum, and
- * with it the near-independent rows that the sign estimator needs, at O(d log d) instead
- * of O(d^2). The overall scale is left uncalibrated and absorbed downstream.
+ * flipu * spectr is an i.i.d. N(0, 1) diagonal, so every coordinate pair of S y and S r is
+ * exactly bivariate Gaussian with covariance <y, r> / d, the law of a d by d matrix with
+ * N(0, 1/d) entries. The QJL sign estimator is then unbiased with get_scale.
  */
 class FastfoodSketch {
 public:
@@ -73,29 +71,33 @@ public:
     inline size_t get_paddim() const { return paddim_; }
     static inline size_t get_words(size_t paddim) { return 3 * paddim; }
 
+    /**
+     * @brief QJL dequantization scale of this sketch.
+     *
+     * TurboQuant's sqrt(pi/2) / d assumes N(0, 1) entries; the normalized Hadamard factors
+     * give N(0, 1/d) entries, which contributes a fixed factor of sqrt(d).
+     *
+     * @param paddim padded dimension
+     * @return scale c with E[c * ||r|| * <S y, sign(S r)>] = <y, r>
+     */
+    static inline float get_scale(size_t paddim) {
+        const double dim = static_cast<double>(paddim);
+        return static_cast<float>(std::sqrt(M_PI / 2.0) / dim * std::sqrt(dim));
+    }
+
 private:
     /**
-     * @brief Sample the Marchenko-Pastur quarter circle by rejection.
+     * @brief Sample the diagonal magnitudes from the half-normal law.
      *
-     * The singular values of a square Gaussian are distributed as sqrt(d) * x with density
-     * proportional to sqrt(4 - x^2) on [0, 2], so sampling that law is equivalent to
-     * extracting the spectrum without forming or decomposing a matrix.
+     * Paired with the independent flipu signs, the diagonal becomes exactly N(0, 1), which
+     * the unbiasedness of get_scale requires; a non-Gaussian magnitude law leaves a bias.
      *
      * @param seed generator seed
      */
     void fill_spectrum(uint32_t seed) {
         std::mt19937 gen(seed);
-        std::uniform_real_distribution<float> ux(0.0f, 2.0f);
-        std::uniform_real_distribution<float> uy(0.0f, 1.0f);
-        for (size_t i = 0; i < paddim_; ++i) {
-            for (;;) {
-                const float x = ux(gen);
-                if (uy(gen) * 2.0f <= std::sqrt(4.0f - x * x)) {
-                    spectr_[i] = x;
-                    break;
-                }
-            }
-        }
+        std::normal_distribution<float> gauss(0.0f, 1.0f);
+        for (size_t i = 0; i < paddim_; ++i) spectr_[i] = std::fabs(gauss(gen));
     }
 
     /**
