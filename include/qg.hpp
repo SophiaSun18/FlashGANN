@@ -77,7 +77,7 @@ public:
     inline size_t get_row_offset() const { return row_offset_; }
     inline vidType get_entry_point() const { return entry_point_; }
 
-    void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx,
+    void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx, uint32_t* iters,
                              int beam_sz, double& elapsed);
 
 private:

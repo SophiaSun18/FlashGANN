@@ -9,7 +9,7 @@ void QuantizedPrunedBeamSearch(
     int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
     const float* __restrict__ d_queries, const float* __restrict__ d_qg_data, const float* __restrict__ d_qg_signs,
     const float* __restrict__ d_qg_sketch, const float* __restrict__ d_qg_levels,
-    vidType* __restrict__ d_results, vidType entry_point,
+    vidType* __restrict__ d_results, uint32_t* __restrict__ d_iters, vidType entry_point,
     size_t row_offset, size_t neighbor_offset, size_t code_offset, size_t sign_offset,
     size_t factor_offset, int max_iter_by_beam, float phase2_rho, bool use_ip)
 {
@@ -151,7 +151,8 @@ void QuantizedPrunedBeamSearch(
     __syncthreads();
 
     // loop end condition: either entire topK expanded, or reach max iteration
-    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+    int iter = 0;
+    for (; iter < MAX_ITERATIONS; iter++) {
 
         // periodically rebuild the small visited set
         if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
@@ -509,6 +510,7 @@ void QuantizedPrunedBeamSearch(
             }
             d_results[query_id * K + i] = (result == MAX_INDEX) ? last_result : result;
         }
+        d_iters[query_id] = static_cast<uint32_t>(iter);
     }
 
 }
