@@ -11,6 +11,7 @@ constexpr unsigned DEGREE = 32;
 constexpr unsigned RUNS = 5;
 constexpr unsigned SEED = 42;
 constexpr unsigned BEAMS[] = {64, 128, 256, 512};
+constexpr unsigned SPECS[] = {1, 2, 4, 6, 8, 10, 12, 14, 16};
 
 /** @brief One profiled configuration of the beam search sort sequence. */
 struct Shape {
@@ -196,11 +197,13 @@ int main() {
     CUDA_SAFE_CALL(cudaMemcpy(index, hindex.data(), count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
 
-    // [3] sweep every beam at the full speculation degree of this block
+    // [3] sweep every speculation degree this block admits over every beam
     std::vector<Timing> rows;
-    const unsigned spec = WARPS_PER_BLOCK;
-    for (unsigned beam : BEAMS) {
-        rows.push_back(flashrun(Shape{beam, cand, (beam * 11 + 9) / 10, spec}, dist, index));
+    for (unsigned spec : SPECS) {
+        if (spec > WARPS_PER_BLOCK) continue;
+        for (unsigned beam : BEAMS) {
+            rows.push_back(flashrun(Shape{beam, cand, (beam * 11 + 9) / 10, spec}, dist, index));
+        }
     }
     report(rows);
 
