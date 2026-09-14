@@ -13,7 +13,7 @@ target_link_libraries(test_turbo PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME test_turbo COMMAND test_turbo)
 
 enable_language(CUDA)
-foreach(BLOCK 64 128 256)
+foreach(BLOCK 32 64 128 192 256 320 384 448 512)
     add_executable(profile_sort_${BLOCK} unittest/profile_sort.cu)
     target_include_directories(profile_sort_${BLOCK} PRIVATE ${CMAKE_SOURCE_DIR})
     target_compile_definitions(profile_sort_${BLOCK} PRIVATE BLOCK_SIZE=${BLOCK})

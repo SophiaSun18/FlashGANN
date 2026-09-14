@@ -196,12 +196,11 @@ int main() {
     CUDA_SAFE_CALL(cudaMemcpy(index, hindex.data(), count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
 
-    // [3] sweep single-parent and full speculation over every beam
+    // [3] sweep every beam at the full speculation degree of this block
     std::vector<Timing> rows;
-    for (unsigned spec : {1u, static_cast<unsigned>(WARPS_PER_BLOCK)}) {
-        for (unsigned beam : BEAMS) {
-            rows.push_back(flashrun(Shape{beam, cand, (beam * 11 + 9) / 10, spec}, dist, index));
-        }
+    const unsigned spec = WARPS_PER_BLOCK;
+    for (unsigned beam : BEAMS) {
+        rows.push_back(flashrun(Shape{beam, cand, (beam * 11 + 9) / 10, spec}, dist, index));
     }
     report(rows);
 
