@@ -453,6 +453,8 @@ void QuantizedPrunedBeamSearch(
                     effective_keep_count = keep_count_for_expander(active_neighbors, adaptive_state, kth_cutoff_valid, __popc(near_cutoff_mask));
                 }
                 const bool keep_lane = keep_all_valid ? valid_candidate : warp_keep_topk_smallest_f32(est_dist, valid_candidate, effective_keep_count);
+                // every warp finishes its visited check before any warp inserts
+                __syncthreads();
                 uint32_t inserted = 0;
                 if (keep_lane) {
                     inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
