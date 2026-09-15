@@ -12,7 +12,7 @@
 /** SHAME(TALLFUNC) */
 int main(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt]\n", argv[0]);
         return 1;
     }
 
@@ -26,6 +26,7 @@ int main(int argc, char** argv) {
     int degree = 32;
     int code_bits = 1;
     std::string csv_file;
+    std::string iters_file;
 
     int arg_idx = 5;
     if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
@@ -35,6 +36,8 @@ int main(int argc, char** argv) {
         std::string arg = argv[arg_idx];
         if (arg == "-csv" && arg_idx + 1 < argc) {
             csv_file = argv[++arg_idx];
+        } else if (arg == "-iters" && arg_idx + 1 < argc) {
+            iters_file = argv[++arg_idx];
         } else if (arg == "-quant" && arg_idx + 1 < argc) {
             g_quant_type = quant_parse(argv[++arg_idx]);
         } else if (arg == "-bits" && arg_idx + 1 < argc) {
@@ -83,10 +86,11 @@ int main(int argc, char** argv) {
     const std::vector<int>& groundtruth = groundtruth_vectors.values;
 
     std::vector<vidType> results(nq * K);
+    std::vector<uint32_t> iters(nq);
     double elapsed = 0.0;
     QuantizationGraph qg(base.count, base.dim, degree, qg_codebook, g_quant_type, code_bits);
     qg.set_metric(g_metric_type);
-    qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(),
+    qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(), iters.data(),
                            beam_size, elapsed);
 
     const float recall = compute_recall_dedup(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
@@ -111,6 +115,17 @@ int main(int argc, char** argv) {
     if (!csv_file.empty()) {
         append_run_stats_to_csv(csv_file, K, beam_size, run_stats);
         printf("Saved GPU stats CSV row to: %s\n", csv_file.c_str());
+    }
+
+    if (!iters_file.empty()) {
+        FILE* fout = fopen(iters_file.c_str(), "w");
+        if (fout == nullptr) {
+            fprintf(stderr, "Cannot open iteration output: %s\n", iters_file.c_str());
+            return 1;
+        }
+        for (uint32_t count : iters) fprintf(fout, "%u\n", count);
+        fclose(fout);
+        printf("Saved per-query iterations to: %s\n", iters_file.c_str());
     }
 
     return 0;

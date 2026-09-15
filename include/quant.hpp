@@ -10,7 +10,12 @@
 #define QUANT_HD
 #endif
 
-/** @brief Quantizer family used to build and scan the packed neighbor codes. */
+/**
+ * @brief Quantizer family used to build and scan the packed neighbor codes.
+ *
+ * QUANT_TBQ is TurboQuant's inner-product algorithm: an MSE stage at bits-1 bits over the
+ * unit residual, then one QJL sign bit per dimension over what that stage leaves behind.
+ */
 enum QuantType { QUANT_RBQ, QUANT_TBQ };
 
 inline QuantType g_quant_type = QUANT_RBQ;
@@ -91,6 +96,43 @@ QUANT_HD inline constexpr size_t quant_lutbytes(size_t paddim, int bits) {
  * @param bits bits per dimension
  * @return true when the width divides the nibble evenly
  */
-inline constexpr bool quant_valid(int bits) {
+QUANT_HD inline constexpr bool quant_valid(int bits) {
     return bits == 1 || bits == 2 || bits == 4;
+}
+
+/**
+ * @brief Bit width of the MSE stage, the remaining bit going to the QJL sign.
+ * @param bits total bits per dimension
+ * @return bits spent on the MSE stage
+ */
+QUANT_HD inline constexpr int quant_stage(int bits) {
+    return bits - 1;
+}
+
+/**
+ * @brief Per-neighbor factor slots a quantizer needs.
+ * @param quant quantizer family
+ * @return 3 for the single-stage scan, 5 for the two-stage scan
+ */
+QUANT_HD inline constexpr int quant_factors(QuantType quant) {
+    return quant == QUANT_TBQ ? 5 : 3;
+}
+
+/**
+ * @brief Whether a total width leaves a decodable MSE stage after the sign bit.
+ * @param bits total bits per dimension
+ * @return true when bits - 1 divides the nibble evenly
+ */
+QUANT_HD inline constexpr bool quant_validprod(int bits) {
+    return quant_valid(quant_stage(bits));
+}
+
+/**
+ * @brief Whether a quantizer and width pair has a scan instantiation.
+ * @param quant quantizer family
+ * @param bits total bits per dimension
+ * @return true when the pair is supported
+ */
+QUANT_HD inline constexpr bool quant_supported(QuantType quant, int bits) {
+    return quant == QUANT_TBQ ? quant_validprod(bits) : quant_valid(bits);
 }

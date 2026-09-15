@@ -149,7 +149,8 @@ static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t ma
     return capacity;
 }
 
-static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg, int bitlen, int bits) { // SHAME(MANYARG)
+static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg, int bitlen,
+                                                          int bits, QuantType quant) { // SHAME(MANYARG)
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     const size_t candidate_buffer_size = round_up_power2_u32(candidate_buffer_capacity(static_cast<uint32_t>(max_deg)));
     const uint32_t padded_beam_size = effective_sort_beam_size(static_cast<uint32_t>(beam_sz));
@@ -163,7 +164,13 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += SEARCH_WIDTH * sizeof(DISTANCE_T);                 // PARENT_DISTANCE_LIST: exact distances for selected parents
     size += dim * sizeof(DATA_T);                              // QUERY_BUFFER
     size += padded_dim * sizeof(float);                        // ROTATED_QUERY_BUFFER
-    size += quant_lutbytes(padded_dim, bits) * sizeof(uint8_t); // LUT_BUFFER
+    const bool prod = quant == QUANT_TBQ;
+    const int stage_bits = prod ? quant_stage(bits) : bits;
+    size += quant_lutbytes(padded_dim, stage_bits) * sizeof(uint8_t); // LUT_BUFFER
+    if (prod) {
+        size += padded_dim * sizeof(float);                     // SKETCH_QUERY_BUFFER
+        size += quant_lutbytes(padded_dim, 1) * sizeof(uint8_t); // SIGN_LUT_BUFFER
+    }
     size += 3 * sizeof(float);                                 // qf low/high/width
     size += sizeof(int32_t);                                   // qf sum_q
     size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));

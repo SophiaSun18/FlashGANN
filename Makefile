@@ -25,10 +25,12 @@ BUILD_HEADERS := \
 	include/common.hpp \
 	include/distance.hpp \
 	include/data_io.hpp \
+	include/encode.hpp \
 	include/metric.hpp \
 	include/pack.hpp \
 	include/quant.hpp \
-	include/rotator.hpp
+	include/rotator.hpp \
+	include/sketch.hpp
 
 .PHONY: all clean
 

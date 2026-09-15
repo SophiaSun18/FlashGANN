@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.18)
+project(FlashGANN CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(OpenMP REQUIRED)
+enable_testing()
+
+add_executable(test_turbo unittest/test_turbo.cc)
+target_include_directories(test_turbo PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_turbo PRIVATE -O3 -march=native)
+target_link_libraries(test_turbo PRIVATE OpenMP::OpenMP_CXX)
+add_test(NAME test_turbo COMMAND test_turbo)
+
+add_executable(test_rabitq unittest/test_rabitq.cc)
+target_include_directories(test_rabitq PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_rabitq PRIVATE -O3 -march=native)
+add_test(NAME test_rabitq COMMAND test_rabitq)
+
+enable_language(CUDA)
+foreach(BLOCK 256 512)
+    add_executable(profile_sort_${BLOCK} unittest/profile_sort.cu)
+    target_include_directories(profile_sort_${BLOCK} PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(profile_sort_${BLOCK} PRIVATE BLOCK_SIZE=${BLOCK})
+    target_compile_options(profile_sort_${BLOCK} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+    add_test(NAME profile_sort_${BLOCK} COMMAND profile_sort_${BLOCK})
+endforeach()
