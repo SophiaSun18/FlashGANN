@@ -12,6 +12,11 @@
 #include "metric.hpp"
 #include "quant.hpp"
 
+inline constexpr int QG_TIMER_QUERY_TRANSFER = 0;
+inline constexpr int QG_TIMER_SEARCH = 1;
+inline constexpr int QG_TIMER_RESULT_COPY = 2;
+inline constexpr int QG_SHARD_TIMER_COUNT = 3;
+
 class QuantizationGraph {
 public:
     // Codebook layout: entry point followed by per-node raw vector, packed codes, factors, and neighbor IDs.
@@ -71,7 +76,7 @@ public:
     inline vidType get_entry_point() const { return entry_point_; }
 
     void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx,
-                             int beam_sz, double& elapsed);
+                             float* result_dist, int beam_sz, double *elapsed);
 
 private:
     void init_layout() {
@@ -93,7 +98,13 @@ private:
         fin.read(reinterpret_cast<char*>(&qtag), sizeof(int32_t));
         fin.read(reinterpret_cast<char*>(&qbits), sizeof(int32_t));
         fin.read(reinterpret_cast<char*>(&nlevel), sizeof(int32_t));
-        if (!fin) throw std::runtime_error("Missing quantizer tail in codebook: " + path);
+        if (!fin) {
+            fin.clear();
+            num_levels_ = 0;
+            printf("Codebook has no quantizer tail; using requested quantizer %s/%d-bit\n",
+                   quant_name(quant_type_), code_bits_);
+            return;
+        }
         if (qtag != static_cast<int32_t>(quant_type_) || qbits != code_bits_) {
             throw std::runtime_error("Codebook quantizer does not match the requested one: " + path);
         }

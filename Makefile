@@ -1,7 +1,8 @@
 NVCC      := nvcc
 ARCH      ?= sm_89
 CXXSTD    := c++20
-NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH) $(EXTRA_NVFLAGS)
+NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH) -Xcompiler -fopenmp $(EXTRA_NVFLAGS)
+NVLIBS    := -lgomp
 PTXAS_FLAGS := -Xptxas -v
 INCLUDES  := -I.
 BIN_DIR   := bin
@@ -38,7 +39,7 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 gpu_flashgann: main.cu gpu_search_adaptive.cu $(AP_HEADERS) | $(BIN_DIR)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -o $@ main.cu gpu_search_adaptive.cu
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -o $@ main.cu gpu_search_adaptive.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
 buildindex: tools/buildindex.cc $(BUILD_HEADERS) | $(BIN_DIR)
