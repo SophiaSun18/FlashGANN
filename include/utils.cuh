@@ -267,6 +267,34 @@ static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, 
     return valid && keep_k > 0 && rank < keep_k;
 }
 
+static __device__ __forceinline__ bool warp_keep_topk_smallest_pair_f32(
+    float value, bool valid, int position,
+    float value0, bool valid0, float value1, bool valid1, int keep_k) {
+    const float my_value = valid ? value : FLT_MAX;
+    const int valid0_int = valid0 ? 1 : 0;
+    const int valid1_int = valid1 ? 1 : 0;
+    int rank = 0;
+
+#pragma unroll
+    for (int src = 0; src < WARP_SIZE; ++src) {
+        const float other0 = __shfl_sync(FULL_MASK, value0, src);
+        const int other0_valid = __shfl_sync(FULL_MASK, valid0_int, src);
+        const int other0_pos = src;
+        if (other0_valid && (other0 < my_value || (other0 == my_value && other0_pos < position))) {
+            rank++;
+        }
+
+        const float other1 = __shfl_sync(FULL_MASK, value1, src);
+        const int other1_valid = __shfl_sync(FULL_MASK, valid1_int, src);
+        const int other1_pos = src + WARP_SIZE;
+        if (other1_valid && (other1 < my_value || (other1 == my_value && other1_pos < position))) {
+            rank++;
+        }
+    }
+
+    return valid && keep_k > 0 && rank < keep_k;
+}
+
 /*-------------------------------------------- distance --------------------------------------------*/
 template <typename T = float>
 __device__ __forceinline__ T warp_l2_distance(int dim, const T *a, const T *b) {

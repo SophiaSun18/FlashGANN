@@ -22,6 +22,10 @@ static __host__ __forceinline__ float compute_max_rho_bound(uint32_t degree) {
     return 1.0f - static_cast<float>(MIN_PHASE2_KEEP) / static_cast<float>(degree);
 }
 
+static __host__ __device__ __forceinline__ float initial_rho_for_bound(float phase2_rho) {
+    return fminf(static_cast<float>(PHASE1_RHO), phase2_rho);
+}
+
 static __device__ __forceinline__ DISTANCE_T get_current_kth_cutoff(
     int K, int beam_sz, const INDEX_T* topk_index, const DISTANCE_T* topk_distance) {
     if (topk_index[beam_sz - 1] == MAX_INDEX) return FLT_MAX;
@@ -100,17 +104,13 @@ static __device__ __forceinline__ GPUAdaptiveSearchState update_adaptive_state(
     state.last_expander_distance = last_expander_distance;
     state.current_expander_distance = current_expander_distance;
 
-    const float tune_span = phase2_rho > PHASE1_RHO
-        ? phase2_rho - PHASE1_RHO
-        : RHO_MAX - RHO_MIN;
+    const float rho_start = initial_rho_for_bound(phase2_rho);
+    const float tune_span = phase2_rho - rho_start;
     const float base_prune = previous_state.policy_iters == 0
-        ? PHASE1_RHO
+        ? rho_start
         : previous_state.adaptive_rho;
     const float rho_delta = tune_span * distance_reduction_rate;
-    const float next_prune_cap = phase2_rho > PHASE1_RHO
-        ? phase2_rho
-        : RHO_MAX;
-    const float next_prune = clamp_float(base_prune + rho_delta, RHO_MIN, next_prune_cap);
+    const float next_prune = clamp_float(base_prune + rho_delta, rho_start, phase2_rho);
 
     state.adaptive_spec_degree = static_cast<int>(PHASE1_THETA);
     state.adaptive_rho = next_prune;
@@ -125,7 +125,11 @@ static __device__ __forceinline__ int keep_count_for_expander(
 
     const int rho_keep = static_cast<int>(keep_count_per_parent(active_neighbors, state.adaptive_rho));
     const uint32_t spec_degree = static_cast<uint32_t>(state.adaptive_spec_degree);
-    const uint32_t per_parent_bound = static_cast<uint32_t>(BUFFER_BOUND) / spec_degree;
+    uint32_t candidate_bound = static_cast<uint32_t>(BUFFER_BOUND);
+    if (active_neighbors <= WARP_SIZE && candidate_bound > WARP_SIZE) {
+        candidate_bound = WARP_SIZE;
+    }
+    const uint32_t per_parent_bound = candidate_bound / spec_degree;
     const int budget_keep = clamp_int(static_cast<int>(per_parent_bound), 1, active_count);
     int max_keep = (rho_keep < budget_keep) ? rho_keep : budget_keep;
     if (kth_cutoff_valid) {
@@ -145,6 +149,9 @@ static __device__ __forceinline__ T* allocate_shared_tail_array(char*& tail_base
 static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t max_degree) {
     const uint32_t max_capacity = static_cast<uint32_t>(THETA_MAX) * max_degree;
     uint32_t capacity = static_cast<uint32_t>(BUFFER_BOUND);
+    if (max_degree <= WARP_SIZE && capacity > WARP_SIZE) {
+        capacity = WARP_SIZE;
+    }
     if (capacity > max_capacity) capacity = max_capacity;
     return capacity;
 }

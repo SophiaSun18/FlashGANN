@@ -51,7 +51,7 @@
 
 // Candidate-buffer budget used by the AP controller.
 #ifndef BUFFER_BOUND
-#define BUFFER_BOUND 32
+#define BUFFER_BOUND 64
 #endif
 
 // Phase policy. Stage I uses progress-based rho tuning from PHASE1_RHO;
