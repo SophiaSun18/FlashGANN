@@ -43,7 +43,7 @@ static SearchKernel select_kernel(QuantType quant, int bits) {
 }
 
 void QuantizationGraph::gpu_search_adaptive(
-    int nq, const float *queries, int K, vidType *result_idx, uint32_t *iters,
+    int nq, const float *queries, int K, vidType *result_idx, uint32_t *iters, int repeat,
     int beam_sz, double &elapsed) {
     int padded_beam_size = static_cast<int>(effective_sort_beam_size(static_cast<uint32_t>(beam_sz)));
     const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * this->degree_;
@@ -150,17 +150,27 @@ void QuantizationGraph::gpu_search_adaptive(
 
     int max_iter_by_beam = (beam_sz * 11 + 9) / 10;
     printf("\nStarting GPU adaptive search...\n");
-    auto start = std::chrono::high_resolution_clock::now();
-    kernel<<<num_blocks, num_threads, shm_size>>>(
-        K, nq, static_cast<int>(this->dim_), beam_sz, bitlen, static_cast<int>(this->degree_),
-        this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_sketch, d_qg_levels, d_results, d_iters,
-        entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_sign_offset(), this->get_factor_offset(),
-        max_iter_by_beam, phase2_rho, this->get_metric() == METRIC_IP);
-    CUDA_SAFE_CALL(cudaGetLastError());
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-    elapsed = std::chrono::duration<double>(end - start).count();
+    double total = 0.0;
+    for (int launch = 0; launch < repeat; launch++) {
+        // [1] wall-clock stamps let external samplers isolate the search window
+        const auto wallstart = std::chrono::system_clock::now();
+        auto start = std::chrono::high_resolution_clock::now();
+        kernel<<<num_blocks, num_threads, shm_size>>>(
+            K, nq, static_cast<int>(this->dim_), beam_sz, bitlen, static_cast<int>(this->degree_),
+            this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_sketch, d_qg_levels, d_results, d_iters,
+            entry_point, this->get_row_offset(), this->get_neighbor_offset(),
+            this->get_code_offset(), this->get_sign_offset(), this->get_factor_offset(),
+            max_iter_by_beam, phase2_rho, this->get_metric() == METRIC_IP);
+        CUDA_SAFE_CALL(cudaGetLastError());
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        const auto wallend = std::chrono::system_clock::now();
+        total += std::chrono::duration<double>(end - start).count();
+        printf("Launch %d window: start_ms=%lld end_ms=%lld\n", launch,
+               static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(wallstart.time_since_epoch()).count()),
+               static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(wallend.time_since_epoch()).count()));
+    }
+    elapsed = total / repeat;
 
     CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, results_bytes, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(iters, d_iters, iters_bytes, cudaMemcpyDeviceToHost));
