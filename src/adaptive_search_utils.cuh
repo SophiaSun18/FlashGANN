@@ -149,6 +149,16 @@ static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t ma
     return capacity;
 }
 
+/**
+ * @brief Slots of the per-lane keep scratch that carries pruned children from check waves to insert waves.
+ * @param maxdegree neighbors per parent
+ * @return one slot per lane of every tile of SEARCH_WIDTH parents
+ */
+static __host__ __device__ inline uint32_t scratchsize(uint32_t maxdegree) {
+    const uint32_t tiles = (maxdegree + WARP_SIZE - 1) / WARP_SIZE;
+    return static_cast<uint32_t>(SEARCH_WIDTH) * tiles * WARP_SIZE;
+}
+
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg, int bitlen,
                                                           int bits, QuantType quant) { // SHAME(MANYARG)
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
@@ -179,5 +189,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
         size = static_cast<size_t>(align_up_uintptr(size, alignof(DISTANCE_T)));
         size += padded_beam_size * sizeof(DISTANCE_T);          // MERGED_TOPK_DISTANCE scratch
     }
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));
+    size += scratchsize(static_cast<uint32_t>(max_deg)) * sizeof(INDEX_T); // KEEP_INDEX scratch
     return static_cast<uint32_t>(size);
 }

@@ -12,7 +12,7 @@
 /** SHAME(TALLFUNC) */
 int main(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> [K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt] [-repeat n]\n", argv[0]);
         return 1;
     }
 
@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     int code_bits = 1;
     std::string csv_file;
     std::string iters_file;
+    int repeat = 1;
 
     int arg_idx = 5;
     if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
@@ -38,6 +39,9 @@ int main(int argc, char** argv) {
             csv_file = argv[++arg_idx];
         } else if (arg == "-iters" && arg_idx + 1 < argc) {
             iters_file = argv[++arg_idx];
+        } else if (arg == "-repeat" && arg_idx + 1 < argc) {
+            repeat = atoi(argv[++arg_idx]);
+            if (repeat < 1) repeat = 1;
         } else if (arg == "-quant" && arg_idx + 1 < argc) {
             g_quant_type = quant_parse(argv[++arg_idx]);
         } else if (arg == "-bits" && arg_idx + 1 < argc) {
@@ -91,7 +95,7 @@ int main(int argc, char** argv) {
     QuantizationGraph qg(base.count, base.dim, degree, qg_codebook, g_quant_type, code_bits);
     qg.set_metric(g_metric_type);
     qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(), iters.data(),
-                           beam_size, elapsed);
+                           repeat, beam_size, elapsed);
 
     const float recall = compute_recall_dedup(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
     const double latency_ms = (nq > 0) ? (elapsed * 1000.0 / static_cast<double>(nq)) : 0.0;
