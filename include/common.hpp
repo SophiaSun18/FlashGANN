@@ -9,6 +9,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "distance.hpp"
 
@@ -64,6 +65,31 @@ float compute_recall(const T *predicted, const int *groundtruth, size_t nq, int 
     }
     return float(correct) / (nq * topk);
 }
+
+template <typename T>
+float compute_recall_dedup(const T *predicted, const int *groundtruth, size_t nq, int topk, int gt_k) {
+    size_t correct = 0;
+    const int eval_k = std::min(topk, gt_k);
+    for (size_t i = 0; i < nq; ++i) {
+        std::unordered_set<int> final_set;
+        final_set.reserve(static_cast<size_t>(topk));
+        for (int j = 0; j < topk; ++j) {
+            int pred = int(predicted[i * topk + j]);
+            if (!final_set.insert(pred).second) {
+                continue;
+            }
+            for (int k = 0; k < eval_k; ++k) {
+                int gt = groundtruth[i * gt_k + k];
+                if (pred == gt) {
+                    ++correct;
+                    break;
+                }
+            }
+        }
+    }
+    return float(correct) / (nq * topk);
+}
+
 
 inline void append_run_stats_to_csv(const std::string &filename, int k, int beam, const RunStats &stats) {
     bool file_exists = std::filesystem::exists(filename);
