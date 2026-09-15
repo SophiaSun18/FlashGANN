@@ -20,6 +20,62 @@ struct BuildSpec {
 };
 
 /**
+ * @brief Encode one parent's neighbor list with the RaBitQ signed uniform grid.
+ * @param spec index shape
+ * @param rotu rotated parent vector
+ * @param rotv rotated neighbor vectors, degree by paddim
+ * @param codes scratch of paddim per-dimension codes
+ * @param resid scratch of paddim floats, left holding the last unit residual
+ * @param row destination row, positioned at the parent
+ * @param codeoff packed code offset within the row
+ * @param facoff factor block offset within the row
+ */
+static inline void encode_rbq(const BuildSpec& spec, const float* rotu, const float* rotv, uint8_t* codes,
+                              float* resid, float* row, size_t codeoff, size_t facoff) { // SHAME(MANYARG)
+    const int bits = spec.codebit;
+    const size_t words = quant_words(spec.paddim, bits);
+    const float fhtfix = 1.0f / std::sqrt(static_cast<float>(spec.paddim));
+    const float span = static_cast<float>((1 << bits) - 1);
+    const float gain = static_cast<float>(bits);
+    const int deg = spec.degree;
+
+    for (int j = 0; j < deg; ++j) {
+        const float* vec = rotv + static_cast<size_t>(j) * spec.paddim;
+
+        // [1] unit residual against the parent
+        float normsq = 0.0f;
+        for (size_t k = 0; k < spec.paddim; ++k) {
+            resid[k] = vec[k] - rotu[k];
+            normsq += resid[k] * resid[k];
+        }
+        const float xnorm = std::sqrt(normsq);
+        const float inv = (xnorm > 0.0f) ? (1.0f / xnorm) : 0.0f;
+        for (size_t k = 0; k < spec.paddim; ++k) resid[k] *= inv;
+
+        // [2] grid code and its direction, scanned as y = 2c / span - 1
+        const float cos = gridcode(spec.paddim, bits, resid, codes);
+        const float facx0 = (xnorm > 0.0f) ? cos : 1.0f;
+        float ysum = 0.0f, ysq = 0.0f, ipu = 0.0f;
+        for (size_t k = 0; k < spec.paddim; ++k) {
+            const float y = 2.0f * static_cast<float>(codes[k]) / span - 1.0f;
+            ysum += y;
+            ysq += y * y;
+            ipu += rotu[k] * y;
+        }
+        const float ynorm = std::sqrt(ysq);
+
+        // [3] factors of |q - u|^2 + |r|^2 - 2 |r| <y, q - u> / <y, o>
+        const float xx0 = xnorm / facx0;
+        row[facoff + j] = xnorm * xnorm + 2.0f * xx0 * ipu / ynorm;
+        row[facoff + deg + j] = -2.0f * xx0 * fhtfix / (ynorm * gain);
+        row[facoff + 2 * deg + j] = -2.0f * xx0 * fhtfix * ysum / ynorm;
+
+        pack_codes(spec.paddim, bits, codes,
+                   reinterpret_cast<uint8_t*>(row + codeoff + static_cast<size_t>(j) * words));
+    }
+}
+
+/**
  * @brief Encode one parent's neighbor list with a TurboQuant level table.
  * @param spec index shape
  * @param sketch QJL sketch over the padded dimension

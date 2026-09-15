@@ -1,10 +1,15 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
+#include <queue>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "quant.hpp"
@@ -80,4 +85,64 @@ inline uint8_t quantize_level(const std::vector<float>& levels, float value) {
         }
     }
     return static_cast<uint8_t>(lo);
+}
+
+/**
+ * @brief Pick the signed uniform grid code whose direction lies closest to a unit vector.
+ *
+ * Code c reconstructs to 2c - (2^bits - 1), an odd integer, so the sign rides in the code
+ * and the magnitude cell m maps to 2m + 1. Sweeps every scale at which a magnitude cell
+ * crosses, the Extended RaBitQ search, and keeps the cell set of highest cosine.
+ *
+ * @param paddim padded dimension
+ * @param bits bits per dimension
+ * @param unit unit-norm rotated residual
+ * @param codes destination of paddim codes, each below 2^bits
+ * @return cosine between unit and the reconstructed grid direction
+ */
+static inline float gridcode(size_t paddim, int bits, const float* unit, uint8_t* codes) {
+    using Event = std::pair<float, size_t>;
+    const int half = 1 << (bits - 1);
+    std::vector<int> mag(paddim, 0);
+    std::vector<size_t> order;
+    order.reserve(paddim * static_cast<size_t>(half - 1));
+    std::priority_queue<Event, std::vector<Event>, std::greater<Event>> heap;
+
+    // [1] start every magnitude at the lowest cell and queue its first crossing
+    double num = 0.0, den = 0.0;
+    for (size_t k = 0; k < paddim; ++k) {
+        const float a = std::fabs(unit[k]);
+        num += a;
+        den += 1.0;
+        if (half > 1 && a > 0.0f) heap.emplace(1.0f / a, k);
+    }
+
+    // [2] sweep crossings in increasing scale and remember the best prefix
+    double best = num / std::sqrt(den);
+    size_t bestn = 0;
+    while (!heap.empty()) {
+        const size_t k = heap.top().second;
+        heap.pop();
+        const float a = std::fabs(unit[k]);
+        const int m = ++mag[k];
+        num += 2.0 * a;
+        den += 8.0 * m;
+        order.push_back(k);
+        if (m + 1 < half) heap.emplace(static_cast<float>(m + 1) / a, k);
+        const double cos = num / std::sqrt(den);
+        if (cos > best) best = cos, bestn = order.size();
+    }
+
+    // [3] replay the best prefix and fold the sign back into the code
+    std::fill(mag.begin(), mag.end(), 0);
+    for (size_t i = 0; i < bestn; ++i) ++mag[order[i]];
+    double ip = 0.0, sq = 0.0;
+    for (size_t k = 0; k < paddim; ++k) {
+        const bool pos = unit[k] >= 0.0f;
+        codes[k] = static_cast<uint8_t>(pos ? half + mag[k] : half - 1 - mag[k]);
+        const double y = pos ? 2.0 * mag[k] + 1.0 : -2.0 * mag[k] - 1.0;
+        ip += unit[k] * y;
+        sq += y * y;
+    }
+    return static_cast<float>(ip / std::sqrt(sq));
 }

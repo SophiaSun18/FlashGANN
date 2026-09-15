@@ -12,6 +12,11 @@ target_compile_options(test_turbo PRIVATE -O3 -march=native)
 target_link_libraries(test_turbo PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME test_turbo COMMAND test_turbo)
 
+add_executable(test_rabitq unittest/test_rabitq.cc)
+target_include_directories(test_rabitq PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_rabitq PRIVATE -O3 -march=native)
+add_test(NAME test_rabitq COMMAND test_rabitq)
+
 enable_language(CUDA)
 foreach(BLOCK 256 512)
     add_executable(profile_sort_${BLOCK} unittest/profile_sort.cu)

@@ -134,5 +134,5 @@ QUANT_HD inline constexpr bool quant_validprod(int bits) {
  * @return true when the pair is supported
  */
 QUANT_HD inline constexpr bool quant_supported(QuantType quant, int bits) {
-    return quant == QUANT_TBQ ? quant_validprod(bits) : (bits == 1);
+    return quant == QUANT_TBQ ? quant_validprod(bits) : quant_valid(bits);
 }

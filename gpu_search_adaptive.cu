@@ -34,7 +34,12 @@ static SearchKernel select_kernel(QuantType quant, int bits) {
             default: return nullptr;
         }
     }
-    return (bits == 1) ? QuantizedPrunedBeamSearch<1, false> : nullptr;
+    switch (bits) {
+        case 1: return QuantizedPrunedBeamSearch<1, false>;
+        case 2: return QuantizedPrunedBeamSearch<2, false>;
+        case 4: return QuantizedPrunedBeamSearch<4, false>;
+        default: return nullptr;
+    }
 }
 
 void QuantizationGraph::gpu_search_adaptive(

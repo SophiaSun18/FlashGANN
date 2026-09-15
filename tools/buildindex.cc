@@ -59,51 +59,6 @@ static void read_graph(const std::string& path, const BuildSpec& spec, std::vect
 }
 
 /**
- * @brief Encode one parent's neighbor list with the 1-bit RaBitQ codebook.
- * @param spec index shape
- * @param rotu rotated parent vector
- * @param rotv rotated neighbor vectors, degree by paddim
- * @param codes scratch of paddim per-dimension codes
- * @param row destination row, positioned at the parent
- * @param codeoff packed code offset within the row
- * @param facoff factor block offset within the row
- */
-static void encode_rbq(const BuildSpec& spec, const float* rotu, const float* rotv, uint8_t* codes,
-                       float* row, size_t codeoff, size_t facoff) { // SHAME(MANYARG)
-    const size_t words = quant_words(spec.paddim, spec.codebit);
-    const float facnorm = 1.0f / std::sqrt(static_cast<float>(spec.paddim));
-    const float fhtfix = 1.0f / std::sqrt(static_cast<float>(spec.paddim));
-
-    for (int j = 0; j < spec.degree; ++j) {
-        const float* vec = rotv + static_cast<size_t>(j) * spec.paddim;
-        int binsum = 0;
-        float sum0 = 0.0f, sum1 = 0.0f, normsq = 0.0f;
-        for (size_t k = 0; k < spec.paddim; ++k) {
-            const float r = vec[k] - rotu[k];
-            const float sx = (r > 0.0f) ? 1.0f : -1.0f;
-            codes[k] = (r > 0.0f) ? 1 : 0;
-            if (r > 0.0f) ++binsum;
-            sum0 += r * sx * facnorm;
-            sum1 += rotu[k] * sx;
-            normsq += r * r;
-        }
-
-        const float xnorm = std::sqrt(normsq);
-        const float facx0 = (xnorm > 0.0f) ? (sum0 / xnorm) : 1.0f;
-        const float facx1 = sum1 * facnorm;
-        const float xx0 = xnorm / facx0;
-
-        row[facoff + j] = xnorm * xnorm + 2.0f * xx0 * facx1;
-        row[facoff + spec.degree + j] = -2.0f * xx0 * facnorm * fhtfix;
-        row[facoff + 2 * spec.degree + j] =
-            -2.0f * xx0 * facnorm * fhtfix * static_cast<float>(binsum * 2 - int(spec.paddim));
-
-        pack_codes(spec.paddim, spec.codebit, codes,
-                   reinterpret_cast<uint8_t*>(row + codeoff + static_cast<size_t>(j) * words));
-    }
-}
-
-/**
  * @brief Write the interleaved index plus its sign vector and quantizer tail.
  * @param path destination file
  * @param spec index shape
@@ -155,7 +110,7 @@ int main(int argc, char** argv) {
     const uint32_t seed = (argc >= 9) ? static_cast<uint32_t>(atoi(argv[8])) : 1u;
 
     if (!quant_supported(qtype, codebit)) {
-        fprintf(stderr, "rbq supports bits=1; tbq supports bits of 2, 3, or 5\n");
+        fprintf(stderr, "rbq supports bits of 1, 2, or 4; tbq supports bits of 2, 3, or 5\n");
         return 1;
     }
 
@@ -226,7 +181,7 @@ int main(int argc, char** argv) {
                            codes.data(), signs.data(), resid.data(), proj.data(), row,
                            codeoff, signoff, facoff);
             } else {
-                encode_rbq(spec, rotu, rotv.data(), codes.data(), row, codeoff, facoff);
+                encode_rbq(spec, rotu, rotv.data(), codes.data(), resid.data(), row, codeoff, facoff);
             }
         }
     }

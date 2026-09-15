@@ -145,6 +145,8 @@ void QuantizedPrunedBeamSearch(
         sketch_apply(qf.rotated_query, qb.rotated_query, d_qg_sketch, d_qg_sketch + padded_dim,
                      d_qg_sketch + 2 * padded_dim, padded_dim, padded_dim);
         lut_build<1>(qb, nullptr, padded_dim);
+    } else if constexpr (CODEBITS > 1) {
+        turboq_prepare_lut_gpu<CODEBITS>(QUERY_BUFFER, qf, d_qg_signs, nullptr, dim, padded_dim);
     } else {
         query_prepare_lut_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
     }
