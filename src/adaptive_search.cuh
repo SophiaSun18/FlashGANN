@@ -66,6 +66,8 @@ void QuantizedPrunedBeamSearch(
         MERGED_TOPK_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, padded_beam_size);
         MERGED_TOPK_DISTANCE = allocate_shared_tail_array<DISTANCE_T>(tail_base, padded_beam_size);
     }
+    // per-lane kept children carried from the pruning waves to the insert waves
+    INDEX_T* KEEP_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, scratchsize(static_cast<uint32_t>(max_degree)));
 
     __shared__ QueryFactors qf;
     __shared__ QueryFactors qb;
@@ -386,7 +388,7 @@ void QuantizedPrunedBeamSearch(
             const int tiles_per_parent = (max_degree + WARP_SIZE - 1) / WARP_SIZE;
             const int task_count = static_cast<int>(keep_expanding) * tiles_per_parent;
 
-            // scan parent-neighbor tiles and compact accepted children into the candidate buffer
+            // scan parent-neighbor tiles against the visited set and record each lane's kept child
             for (int task_base = 0; task_base < task_count; task_base += WARPS_PER_BLOCK) {
                 const int task = task_base + warp_id;
                 const bool task_active = task < task_count;
@@ -453,10 +455,19 @@ void QuantizedPrunedBeamSearch(
                     effective_keep_count = keep_count_for_expander(active_neighbors, adaptive_state, kth_cutoff_valid, __popc(near_cutoff_mask));
                 }
                 const bool keep_lane = keep_all_valid ? valid_candidate : warp_keep_topk_smallest_f32(est_dist, valid_candidate, effective_keep_count);
-                // every warp finishes its visited check before any warp inserts
-                __syncthreads();
+                if (task_active) {
+                    KEEP_INDEX[task * WARP_SIZE + lane_id] = keep_lane ? child_id : MAX_INDEX;
+                }
+            }
+            // every wave finishes its visited check and pruning before any wave inserts
+            __syncthreads();
+
+            // insert kept children wave by wave and compact accepted lanes into the candidate buffer
+            for (int task_base = 0; task_base < task_count; task_base += WARPS_PER_BLOCK) {
+                const int task = task_base + warp_id;
+                const INDEX_T child_id = (task < task_count) ? KEEP_INDEX[task * WARP_SIZE + lane_id] : MAX_INDEX;
                 uint32_t inserted = 0;
-                if (keep_lane) {
+                if (child_id != MAX_INDEX) {
                     inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
                 }
 
