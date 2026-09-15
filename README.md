@@ -14,15 +14,25 @@ The executable expects four file inputs followed by the search arguments:
 K                     Number of nearest neighbors to return. Default: 100.
 beam_size             Search beam size. Default: 128.
 graph_degree          Degree of the prebuilt graph/codebook. Default: 32.
+-quant rbq|tbq        Quantizer family of the codebook. Default: rbq.
+-bits <n>             Bits per dimension of the codebook, rbq: 1|2|4, tbq: 2|3|5. Default: 1.
 -csv <result.csv>     Optional CSV output path for runtime, latency, throughput, and recall.
+-iters <output.txt>   Optional per-query search iteration output, one count per line.
 ```
 
 ## Build
 
-Build the FlashGANN executable:
+Build the FlashGANN executable and the index builder:
+
+```bash
+make all
+```
+
+Or build them one at a time:
 
 ```bash
 make gpu_flashgann
+make buildindex
 ```
 
 Optional compile-time flags can be passed through `EXTRA_NVFLAGS`:
@@ -37,6 +47,27 @@ Clean generated binaries with:
 make clean
 ```
 
+## Build Index
+
+`bin/buildindex` encodes a prebuilt graph into a codebook index:
+
+```text
+bin/buildindex <base.fvecs> <graph> <out.index> <rbq|tbq> <bits> [levels.bin] [degree=32] [seed=1]
+```
+
+```text
+<graph>        Adjacency dump: uint32 node count, uint32 degree, then node count * degree uint32 ids.
+rbq <bits>     RaBitQ, 1, 2, or 4 bits per dimension. Multi-bit codes use the Extended RaBitQ grid.
+tbq <bits>     TurboQuant inner-product variant, 2, 3, or 5 bits: a bits-1 MSE stage plus one QJL sign bit.
+[levels.bin]   Reconstruction levels of the tbq MSE stage: int32 bits, int32 count, count floats. Pass - for rbq.
+```
+
+Example, a 2-bit RaBitQ index:
+
+```bash
+bin/buildindex sift_base.fvecs graph-d32 rbq_b2.index rbq 2 - 32 1
+```
+
 ## Example Run
 
 ```bash
@@ -46,8 +77,19 @@ bin/gpu_flashgann \
   <groundtruth.ivecs> \
   <qg_codebook.index> \
   100 128 32 \
+  -quant rbq -bits 2 \
   -csv result.csv
 ```
+
+## Tests
+
+```bash
+cmake -S . -B build
+cmake --build build --target test_rabitq test_turbo
+ctest --test-dir build -R "test_rabitq|test_turbo" --output-on-failure
+```
+
+`test_rabitq` checks the grid code against exhaustive search and the scan factors against the direct estimator. `test_turbo` checks that the TurboQuant estimator is unbiased; it takes several minutes.
 
 ## Paper Reproduction Configurations
 
