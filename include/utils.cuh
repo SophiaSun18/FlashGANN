@@ -1078,7 +1078,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
                   "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
     const float triple_x_value = triple_x[0];
     if (triple_x_value == FLT_MAX)
-        return 0.0f;
+        return exact_dist;
 
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     const int group_lane = lane_id & (LANES_PER_NEIGHBOR - 1);
@@ -1128,7 +1128,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     float triple_x, float factor_dq, float factor_vq,
     float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
     if (triple_x == FLT_MAX)
-        return FLT_MAX;
+        return exact_dist;
 
     constexpr int lut_layout_neighbors = WARP_SIZE / GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES;
     const uint8_t *seq_lut_tile = parent_code_base;
