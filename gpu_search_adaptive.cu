@@ -106,7 +106,10 @@ void QuantizationGraph::gpu_search_adaptive(
     }
 
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_queries, query_bytes));
+    const auto query_load_start = std::chrono::high_resolution_clock::now();
     CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, query_bytes, cudaMemcpyHostToDevice));
+    const auto query_load_end = std::chrono::high_resolution_clock::now();
+    printf("Query Load Time: %.6f ms\n", std::chrono::duration<double, std::milli>(query_load_end - query_load_start).count());
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_qg_data, qg_data_bytes));
     CUDA_SAFE_CALL(cudaMemcpy(d_qg_data, this->get_data_ptr(), qg_data_bytes, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_qg_signs, qg_signs_bytes));
