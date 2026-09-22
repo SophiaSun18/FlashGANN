@@ -1223,7 +1223,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
                   "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
     const float triple_x_value = triple_x[0];
     if (triple_x_value == FLT_MAX)
-        return 0.0f;
+        return exact_dist;
 
     const float result_float = lut_reduce<LANES_PER_NEIGHBOR, CODEBITS>(
         qf, packed_codes_block, neighbor_idx, padded_dim, bytes_per_neighbor);
@@ -1244,7 +1244,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     float triple_x, float factor_dq, float factor_vq,
     float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
     if (triple_x == FLT_MAX)
-        return FLT_MAX;
+        return exact_dist;
 
     const float result_float = lut_reduce<1, CODEBITS>(
         qf, parent_code_base, neighbor_idx, padded_dim, bytes_per_neighbor);
