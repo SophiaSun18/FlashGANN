@@ -554,7 +554,7 @@ __device__ __noinline__ void candidate_by_radix_sort(
 }
 
 template <unsigned N_1, unsigned N_2>
-__device__ void topk_small_by_bitonic_sort(
+__device__ __noinline__ void topk_small_by_bitonic_sort(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     uint32_t CANDIDATE_BUFFER_SIZE,
@@ -681,8 +681,8 @@ __device__ inline int merge_path_partition(
     return low;
 }
 
-template <unsigned N_1, unsigned N_2>
-__device__ void topk_candidate_sort_and_merge(
+template <unsigned N_1>
+__device__ __noinline__ void topk_candidate_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
@@ -1460,51 +1460,8 @@ static __device__ inline void topk_runtime_candidate_sort_and_merge(
     __syncthreads();
 }
 
-template <unsigned N_1, unsigned N_2>
-__device__ void topk_candidate_merge_policy(
-    INDEX_T *result_indices_ptr,
-    DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
-    uint32_t CANDIDATE_BUFFER_SIZE,
-    uint32_t internal_topk,
-    bool first) {
-    if constexpr (N_2 == 1 || N_2 == 2 || N_2 == 4) {
-        topk_small_by_bitonic_sort<N_1, N_2>(
-            result_indices_ptr, result_distances_ptr,
-            CANDIDATE_BUFFER_SIZE, internal_topk, first);
-    } else {
-        topk_candidate_sort_and_merge<N_1, N_2>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            CANDIDATE_BUFFER_SIZE, internal_topk);
-    }
-}
-
-template <unsigned N_1, unsigned N_2>
-__device__ __noinline__ void topk_candidate_merge_width_case(
-    INDEX_T *result_indices_ptr,
-    DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
-    uint32_t candidate_buffer_size,
-    uint32_t internal_topk,
-    bool first) {
-    if (internal_topk % WARP_SIZE == 0) {
-        topk_candidate_merge_policy<N_1, N_2>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-    } else {
-        topk_candidate_sort_and_merge<N_1, N_2>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk);
-    }
-}
-
-// Keep the full 1..32 specialization table. Collapsing it to fewer runtime cases
-// substantially increases ptxas spill loads for the AP kernel.
+// Internal beams 32, 64, and 128 use the warp-bitonic path.
+// Other internal beams use candidate sort plus merge-path.
 template <unsigned N_1>
 __device__ inline void dispatch_topk_candidate_merge_width(
     INDEX_T *result_indices_ptr,
@@ -1514,204 +1471,27 @@ __device__ inline void dispatch_topk_candidate_merge_width(
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
-    switch ((internal_topk + WARP_SIZE - 1) / WARP_SIZE) {
-    case 1:
-        topk_candidate_merge_width_case<N_1, 1>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 2:
-        topk_candidate_merge_width_case<N_1, 2>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 3:
-        topk_candidate_merge_width_case<N_1, 3>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 4:
-        topk_candidate_merge_width_case<N_1, 4>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 5:
-        topk_candidate_merge_width_case<N_1, 5>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 6:
-        topk_candidate_merge_width_case<N_1, 6>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 7:
-        topk_candidate_merge_width_case<N_1, 7>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 8:
-        topk_candidate_merge_width_case<N_1, 8>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 9:
-        topk_candidate_merge_width_case<N_1, 9>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 10:
-        topk_candidate_merge_width_case<N_1, 10>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 11:
-        topk_candidate_merge_width_case<N_1, 11>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 12:
-        topk_candidate_merge_width_case<N_1, 12>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 13:
-        topk_candidate_merge_width_case<N_1, 13>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 14:
-        topk_candidate_merge_width_case<N_1, 14>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 15:
-        topk_candidate_merge_width_case<N_1, 15>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 16:
-        topk_candidate_merge_width_case<N_1, 16>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 17:
-        topk_candidate_merge_width_case<N_1, 17>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 18:
-        topk_candidate_merge_width_case<N_1, 18>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 19:
-        topk_candidate_merge_width_case<N_1, 19>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 20:
-        topk_candidate_merge_width_case<N_1, 20>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 21:
-        topk_candidate_merge_width_case<N_1, 21>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 22:
-        topk_candidate_merge_width_case<N_1, 22>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 23:
-        topk_candidate_merge_width_case<N_1, 23>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 24:
-        topk_candidate_merge_width_case<N_1, 24>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 25:
-        topk_candidate_merge_width_case<N_1, 25>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 26:
-        topk_candidate_merge_width_case<N_1, 26>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 27:
-        topk_candidate_merge_width_case<N_1, 27>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 28:
-        topk_candidate_merge_width_case<N_1, 28>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 29:
-        topk_candidate_merge_width_case<N_1, 29>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 30:
-        topk_candidate_merge_width_case<N_1, 30>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
-    case 31:
-        topk_candidate_merge_width_case<N_1, 31>(
-            result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
-        break;
+    switch (internal_topk) {
     case 32:
-        topk_candidate_merge_width_case<N_1, 32>(
+        topk_small_by_bitonic_sort<N_1, 1>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
+            candidate_buffer_size, internal_topk, first);
+        break;
+    case 64:
+        topk_small_by_bitonic_sort<N_1, 2>(
+            result_indices_ptr, result_distances_ptr,
+            candidate_buffer_size, internal_topk, first);
+        break;
+    case 128:
+        topk_small_by_bitonic_sort<N_1, 4>(
+            result_indices_ptr, result_distances_ptr,
             candidate_buffer_size, internal_topk, first);
         break;
     default:
-        topk_candidate_merge_width_case<N_1, 4>(
+        topk_candidate_sort_and_merge<N_1>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
-            candidate_buffer_size, internal_topk, first);
+            candidate_buffer_size, internal_topk);
         break;
     }
 }
