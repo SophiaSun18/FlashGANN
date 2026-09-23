@@ -69,6 +69,12 @@ void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned sp
         mergedindex = allocate_shared_tail_array<INDEX_T>(tail, padded);
         mergeddist = allocate_shared_tail_array<DISTANCE_T>(tail, padded);
     }
+    void* candidate_radix_scratch = nullptr;
+    if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && cand > 256) {
+        using CandidateRadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
+        candidate_radix_scratch = allocate_shared_tail_array<typename CandidateRadixSort::TempStorage>(
+            tail, 1);
+    }
     for (uint32_t i = tid; i < total; i += blockDim.x) {
         allindex[i] = MAX_INDEX;
         alldist[i] = FLT_MAX;
@@ -83,7 +89,9 @@ void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned sp
             canddist[i] = dist[merged + i];
         }
         __syncthreads();
-        if (sorted) dispatch_topk_candidate_sort_and_merge(allindex, alldist, mergedindex, mergeddist, cand, padded, iter == 0);
+        if (sorted) dispatch_topk_candidate_sort_and_merge(
+            allindex, alldist, mergedindex, mergeddist, candidate_radix_scratch,
+            cand, padded, iter == 0);
         __syncthreads();
 
         // [3] clear the padded beam tail and the consumed candidates
@@ -105,7 +113,7 @@ void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned sp
             canddist[i] = dist[pruned + i];
         }
         __syncthreads();
-        if (sorted) dispatch_candidate_bitonic_sort(candindex, canddist, cand);
+        if (sorted) dispatch_candidate_sort(candindex, canddist, cand, candidate_radix_scratch);
         __syncthreads();
     }
 }
@@ -138,6 +146,9 @@ static Timing flashrun(Shape form, const float *dist, const uint32_t *index) {
     if (topk_external_merge_scratch_needed(padded)) {
         size = align_up_uintptr(size, alignof(INDEX_T)) + padded * sizeof(INDEX_T);
         size = align_up_uintptr(size, alignof(DISTANCE_T)) + padded * sizeof(DISTANCE_T);
+    }
+    if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && form.cand > 256) {
+        size = align_up_uintptr(size, candidate_radix_sort_scratch_alignment()) + candidate_radix_sort_scratch_bytes();
     }
     const int bytes = static_cast<int>(size);
     CUDA_SAFE_CALL(cudaFuncSetAttribute(reinterpret_cast<const void *>(flashsort<true>),

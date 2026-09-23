@@ -66,6 +66,12 @@ void QuantizedPrunedBeamSearch(
         MERGED_TOPK_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, padded_beam_size);
         MERGED_TOPK_DISTANCE = allocate_shared_tail_array<DISTANCE_T>(tail_base, padded_beam_size);
     }
+    void* CANDIDATE_RADIX_SCRATCH = nullptr;
+    if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
+        using CandidateRadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
+        CANDIDATE_RADIX_SCRATCH = allocate_shared_tail_array<typename CandidateRadixSort::TempStorage>(
+            tail_base, 1);
+    }
     // per-lane kept children carried from the pruning waves to the insert waves
     INDEX_T* KEEP_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, scratchsize(static_cast<uint32_t>(max_degree)));
 
@@ -169,7 +175,7 @@ void QuantizedPrunedBeamSearch(
         const uint32_t merge_candidate_count = candidate_buffer_size;
         dispatch_topk_candidate_sort_and_merge(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-            merge_candidate_count, padded_beam_size, (iter == 0));
+            CANDIDATE_RADIX_SCRATCH, merge_candidate_count, padded_beam_size, (iter == 0));
         __syncthreads();
 
         // clear the beam stall part and candidate buffer to avoid stale entries
@@ -345,7 +351,9 @@ void QuantizedPrunedBeamSearch(
                 effective_keep_count = keep_count_for_expander(candidate_work_count, adaptive_state, kth_cutoff_valid, shared_kth_near_count);
 
                 // sort estimated candidates and invalidate entries past the keep budget
-                dispatch_candidate_bitonic_sort(CANDIDATE_INDEX, CANDIDATE_DISTANCE, candidate_buffer_size);
+                dispatch_candidate_sort(
+                    CANDIDATE_INDEX, CANDIDATE_DISTANCE, candidate_buffer_size,
+                    CANDIDATE_RADIX_SCRATCH);
                 __syncthreads();
 
                 for (int i = tid; i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
@@ -513,7 +521,7 @@ void QuantizedPrunedBeamSearch(
     // merge the final candidate batch into the beam
     dispatch_topk_candidate_sort_and_merge(
         ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-        candidate_buffer_size, padded_beam_size, false);
+        CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
     hashtable_init(HASH_TABLE, bitlen);

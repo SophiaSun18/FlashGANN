@@ -151,6 +151,17 @@ __host__ __device__ inline uint32_t hash_bitlen_for_search_workload(
     return bitlen;
 }
 
+__host__ __device__ inline uint32_t candidate_radix_sort_scratch_bytes() {
+    using RadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
+    return static_cast<uint32_t>(sizeof(typename RadixSort::TempStorage));
+}
+
+__host__ __device__ inline uint32_t candidate_radix_sort_scratch_alignment() {
+    using RadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
+    return static_cast<uint32_t>(alignof(typename RadixSort::TempStorage));
+}
+
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
 #define GPU_MAX_WARPS_PER_SM 48
 #else
@@ -485,6 +496,60 @@ __device__ inline void candidate_by_block_bitonic_sort(
             }
             __syncthreads();
         }
+    }
+}
+
+template <unsigned ITEMS_PER_THREAD>
+__device__ __noinline__ void candidate_by_radix_sort_impl(
+    INDEX_T *candidate_indices,
+    DISTANCE_T *candidate_distances,
+    uint32_t candidate_buffer_size,
+    void *radix_scratch) {
+    using RadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, ITEMS_PER_THREAD, INDEX_T>;
+    typename RadixSort::TempStorage &temp_storage =
+        *reinterpret_cast<typename RadixSort::TempStorage *>(radix_scratch);
+    DISTANCE_T keys[ITEMS_PER_THREAD];
+    INDEX_T values[ITEMS_PER_THREAD];
+    for (unsigned i = 0; i < ITEMS_PER_THREAD; ++i) {
+        const uint32_t pos = threadIdx.x * ITEMS_PER_THREAD + i;
+        if (pos < candidate_buffer_size) {
+            keys[i] = candidate_distances[pos];
+            values[i] = candidate_indices[pos];
+        } else {
+            keys[i] = FLT_MAX;
+            values[i] = MAX_INDEX;
+        }
+    }
+    RadixSort(temp_storage).Sort(keys, values);
+    for (unsigned i = 0; i < ITEMS_PER_THREAD; ++i) {
+        const uint32_t pos = threadIdx.x * ITEMS_PER_THREAD + i;
+        if (pos < candidate_buffer_size) {
+            candidate_distances[pos] = keys[i];
+            candidate_indices[pos] = values[i];
+        }
+    }
+}
+
+__device__ __noinline__ void candidate_by_radix_sort(
+    INDEX_T *candidate_indices,
+    DISTANCE_T *candidate_distances,
+    uint32_t candidate_buffer_size,
+    void *radix_scratch) {
+    const uint32_t items_per_thread =
+        (candidate_buffer_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (items_per_thread <= 1) {
+        candidate_by_radix_sort_impl<1>(candidate_indices, candidate_distances,
+                                        candidate_buffer_size, radix_scratch);
+    } else if (items_per_thread <= 2) {
+        candidate_by_radix_sort_impl<2>(candidate_indices, candidate_distances,
+                                        candidate_buffer_size, radix_scratch);
+    } else if (items_per_thread <= 4) {
+        candidate_by_radix_sort_impl<4>(candidate_indices, candidate_distances,
+                                        candidate_buffer_size, radix_scratch);
+    } else {
+        assert(items_per_thread <= 8);
+        candidate_by_radix_sort_impl<8>(candidate_indices, candidate_distances,
+                                        candidate_buffer_size, radix_scratch);
     }
 }
 
@@ -1303,13 +1368,14 @@ static __device__ inline DISTANCE_T turbop_scan(
 }
 
 /*-------------------------------------------- runtime dispatchers --------------------------------------------*/
-__device__ inline void dispatch_candidate_bitonic_sort(
+__device__ inline void dispatch_candidate_sort(
     INDEX_T *candidate_indices,
     DISTANCE_T *candidate_distances,
-    uint32_t candidate_buffer_size) {
+    uint32_t candidate_buffer_size,
+    void *candidate_radix_scratch) {
     const uint32_t warp_items_per_thread =
         (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
-    if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || warp_items_per_thread > 4) {
+    if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT) {
         candidate_by_block_bitonic_sort(candidate_indices, candidate_distances, candidate_buffer_size);
     } else if (warp_items_per_thread <= 1) {
         candidate_by_bitonic_sort<1, 0>(
@@ -1317,9 +1383,15 @@ __device__ inline void dispatch_candidate_bitonic_sort(
     } else if (warp_items_per_thread <= 2) {
         candidate_by_bitonic_sort<2, 0>(
             candidate_indices, candidate_distances, candidate_buffer_size);
-    } else {
+    } else if (warp_items_per_thread <= 4) {
         candidate_by_bitonic_sort<4, 0>(
             candidate_indices, candidate_distances, candidate_buffer_size);
+    } else if (warp_items_per_thread <= 8) {
+        candidate_by_bitonic_sort<8, 0>(
+            candidate_indices, candidate_distances, candidate_buffer_size);
+    } else {
+        candidate_by_radix_sort(candidate_indices, candidate_distances,
+                                candidate_buffer_size, candidate_radix_scratch);
     }
 }
 
@@ -1328,12 +1400,14 @@ static __device__ inline void topk_runtime_candidate_sort_and_merge(
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
     DISTANCE_T *merged_topk_dist_shared,
+    void *candidate_radix_scratch,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk) {
     auto candidate_indices = result_indices_ptr + internal_topk;
     auto candidate_distances = result_distances_ptr + internal_topk;
 
-    dispatch_candidate_bitonic_sort(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
+    dispatch_candidate_sort(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE,
+                                    candidate_radix_scratch);
     __syncthreads();
 
     constexpr int kItemsPerThread = 4;
@@ -1647,14 +1721,15 @@ __device__ inline void dispatch_topk_candidate_sort_and_merge(
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
     DISTANCE_T *merged_topk_dist_shared,
+    void *candidate_radix_scratch,
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
     const uint32_t items_per_thread = (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
-    if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || items_per_thread > 4) {
+    if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT) {
         topk_runtime_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
+            merged_topk_index_shared, merged_topk_dist_shared, candidate_radix_scratch,
             candidate_buffer_size, internal_topk);
     } else if (items_per_thread <= 1) {
         dispatch_topk_candidate_merge_width<1>(
@@ -1666,10 +1741,20 @@ __device__ inline void dispatch_topk_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
-    } else {
+    } else if (items_per_thread <= 4) {
         dispatch_topk_candidate_merge_width<4>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
+    } else if (items_per_thread <= 8) {
+        dispatch_topk_candidate_merge_width<8>(
+            result_indices_ptr, result_distances_ptr,
+            merged_topk_index_shared, merged_topk_dist_shared,
+            candidate_buffer_size, internal_topk, first);
+    } else {
+        topk_runtime_candidate_sort_and_merge(
+            result_indices_ptr, result_distances_ptr,
+            merged_topk_index_shared, merged_topk_dist_shared,
+            candidate_radix_scratch, candidate_buffer_size, internal_topk);
     }
 }
