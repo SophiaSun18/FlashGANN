@@ -65,7 +65,7 @@ void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned sp
     char *tail = reinterpret_cast<char *>(alldist + total);
     INDEX_T *mergedindex = nullptr;
     DISTANCE_T *mergeddist = nullptr;
-    if (topk_external_merge_scratch_needed(padded)) {
+    if (topk_external_merge_scratch_needed(padded, cand)) {
         mergedindex = allocate_shared_tail_array<INDEX_T>(tail, padded);
         mergeddist = allocate_shared_tail_array<DISTANCE_T>(tail, padded);
     }
@@ -89,7 +89,7 @@ void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned sp
             canddist[i] = dist[merged + i];
         }
         __syncthreads();
-        if (sorted) dispatch_topk_candidate_sort_and_merge(
+        if (sorted) dispatch_beam_management(
             allindex, alldist, mergedindex, mergeddist, candidate_radix_scratch,
             cand, padded, iter == 0);
         __syncthreads();
@@ -143,7 +143,7 @@ static double elapsed(LAUNCH &&launch) {
 static Timing flashrun(Shape form, const float *dist, const uint32_t *index) {
     const uint32_t padded = effective_sort_beam_size(form.beam);
     size_t size = static_cast<size_t>(padded + form.cand) * (sizeof(INDEX_T) + sizeof(DISTANCE_T));
-    if (topk_external_merge_scratch_needed(padded)) {
+    if (topk_external_merge_scratch_needed(padded, form.cand)) {
         size = align_up_uintptr(size, alignof(INDEX_T)) + padded * sizeof(INDEX_T);
         size = align_up_uintptr(size, alignof(DISTANCE_T)) + padded * sizeof(DISTANCE_T);
     }

@@ -127,12 +127,8 @@ __host__ __device__ inline uint32_t effective_sort_beam_size(uint32_t beam_size)
     return beam_size;
 }
 
-__host__ __device__ inline bool topk_external_merge_scratch_needed(uint32_t internal_topk) {
-    return GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT ||
-#if defined(SEARCH_WIDTH) && SEARCH_WIDTH > 4
-           true ||
-#endif
-           ((internal_topk + WARP_SIZE - 1) / WARP_SIZE) > 4;
+__host__ __device__ inline bool topk_external_merge_scratch_needed(uint32_t internal_topk, uint32_t candidate_buffer_size) {
+    return GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || candidate_buffer_size > 256 || internal_topk > 256;
 }
 
 __host__ __device__ inline uint32_t hash_bitlen_for_search_workload(
@@ -554,7 +550,7 @@ __device__ __noinline__ void candidate_by_radix_sort(
 }
 
 template <unsigned N_1, unsigned N_2>
-__device__ __noinline__ void topk_small_by_bitonic_sort(
+__device__ __noinline__ void topk_candidate_bitonic_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     uint32_t CANDIDATE_BUFFER_SIZE,
@@ -629,7 +625,7 @@ __device__ __noinline__ void topk_small_by_bitonic_sort(
     /* Merge candidates */
     for (unsigned i = 0; i < N_2; i++) {
         unsigned j = (N_2 * lane_id) + i; // [0:MAX_ITOPK-1]
-        unsigned k = internal_topk - 1 - j;
+        unsigned k = N_2 * WARP_SIZE - 1 - j;
         if (k >= internal_topk || k >= CANDIDATE_BUFFER_SIZE)
             continue;
         auto candidate_key = candidate_distances[k];
@@ -681,8 +677,10 @@ __device__ inline int merge_path_partition(
     return low;
 }
 
+// Sort candidates with the known warp-bitonic capacity N_1, then merge into the sorted beam.
+// Uses block merge-path and external scratch; selected for beams above 256.
 template <unsigned N_1>
-__device__ __noinline__ void topk_candidate_sort_and_merge(
+__device__ __noinline__ void dispatch_topk_candidate_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
@@ -1368,6 +1366,8 @@ static __device__ inline DISTANCE_T turbop_scan(
 }
 
 /*-------------------------------------------- runtime dispatchers --------------------------------------------*/
+// Sort candidates only: warp bitonic through 256, block radix above 256.
+// The forced-block flag overrides both routes with block bitonic if enabled.
 __device__ inline void dispatch_candidate_sort(
     INDEX_T *candidate_indices,
     DISTANCE_T *candidate_distances,
@@ -1395,7 +1395,9 @@ __device__ inline void dispatch_candidate_sort(
     }
 }
 
-static __device__ inline void topk_runtime_candidate_sort_and_merge(
+// Dispatch candidate sorting at runtime, then merge into the sorted beam using external scratch.
+// General fallback for candidates above 256 or forced block sorting, regardless of beam size.
+static __device__ inline void dispatch_topk_candidate_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
@@ -1460,10 +1462,10 @@ static __device__ inline void topk_runtime_candidate_sort_and_merge(
     __syncthreads();
 }
 
-// Internal beams 32, 64, and 128 use the warp-bitonic path.
-// Other internal beams use candidate sort plus merge-path.
+// For a known warp-bitonic candidate capacity N_1, select beam capacity 32/64/128/256.
+// Larger beams use specialized candidate sorting followed by block merge-path.
 template <unsigned N_1>
-__device__ inline void dispatch_topk_candidate_merge_width(
+__device__ inline void dispatch_bitonic_beam_width(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
@@ -1471,32 +1473,33 @@ __device__ inline void dispatch_topk_candidate_merge_width(
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
-    switch (internal_topk) {
-    case 32:
-        topk_small_by_bitonic_sort<N_1, 1>(
+    if (internal_topk <= 32) {
+        topk_candidate_bitonic_sort_and_merge<N_1, 1>(
             result_indices_ptr, result_distances_ptr,
             candidate_buffer_size, internal_topk, first);
-        break;
-    case 64:
-        topk_small_by_bitonic_sort<N_1, 2>(
+    } else if (internal_topk <= 64) {
+        topk_candidate_bitonic_sort_and_merge<N_1, 2>(
             result_indices_ptr, result_distances_ptr,
             candidate_buffer_size, internal_topk, first);
-        break;
-    case 128:
-        topk_small_by_bitonic_sort<N_1, 4>(
+    } else if (internal_topk <= 128) {
+        topk_candidate_bitonic_sort_and_merge<N_1, 4>(
             result_indices_ptr, result_distances_ptr,
             candidate_buffer_size, internal_topk, first);
-        break;
-    default:
-        topk_candidate_sort_and_merge<N_1>(
+    } else if (internal_topk <= 256) {
+        topk_candidate_bitonic_sort_and_merge<N_1, 8>(
+            result_indices_ptr, result_distances_ptr,
+            candidate_buffer_size, internal_topk, first);
+    } else {
+        dispatch_topk_candidate_sort_and_merge<N_1>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk);
-        break;
     }
 }
 
-__device__ inline void dispatch_topk_candidate_sort_and_merge(
+// Top-level route: small candidates select a specialized beam-width path.
+// Large candidates or forced block sorting use the general sort-and-merge fallback.
+__device__ inline void dispatch_beam_management(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     INDEX_T *merged_topk_index_shared,
@@ -1507,32 +1510,32 @@ __device__ inline void dispatch_topk_candidate_sort_and_merge(
     bool first) {
     const uint32_t items_per_thread = (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
     if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT) {
-        topk_runtime_candidate_sort_and_merge(
+        dispatch_topk_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared, candidate_radix_scratch,
             candidate_buffer_size, internal_topk);
     } else if (items_per_thread <= 1) {
-        dispatch_topk_candidate_merge_width<1>(
+        dispatch_bitonic_beam_width<1>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 2) {
-        dispatch_topk_candidate_merge_width<2>(
+        dispatch_bitonic_beam_width<2>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 4) {
-        dispatch_topk_candidate_merge_width<4>(
+        dispatch_bitonic_beam_width<4>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 8) {
-        dispatch_topk_candidate_merge_width<8>(
+        dispatch_bitonic_beam_width<8>(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else {
-        topk_runtime_candidate_sort_and_merge(
+        dispatch_topk_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
             merged_topk_index_shared, merged_topk_dist_shared,
             candidate_radix_scratch, candidate_buffer_size, internal_topk);

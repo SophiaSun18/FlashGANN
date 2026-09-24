@@ -62,7 +62,7 @@ void QuantizedPrunedBeamSearch(
     // reserve optional scratch space for large-beam top-k merge
     INDEX_T* MERGED_TOPK_INDEX = nullptr;
     DISTANCE_T* MERGED_TOPK_DISTANCE = nullptr;
-    if (topk_external_merge_scratch_needed(padded_beam_size)) {
+    if (topk_external_merge_scratch_needed(padded_beam_size, candidate_buffer_size)) {
         MERGED_TOPK_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, padded_beam_size);
         MERGED_TOPK_DISTANCE = allocate_shared_tail_array<DISTANCE_T>(tail_base, padded_beam_size);
     }
@@ -173,7 +173,7 @@ void QuantizedPrunedBeamSearch(
 
         // sort and merge existing candidates into the beam
         const uint32_t merge_candidate_count = candidate_buffer_size;
-        dispatch_topk_candidate_sort_and_merge(
+        dispatch_beam_management(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
             CANDIDATE_RADIX_SCRATCH, merge_candidate_count, padded_beam_size, (iter == 0));
         __syncthreads();
@@ -519,7 +519,7 @@ void QuantizedPrunedBeamSearch(
     }
 
     // merge the final candidate batch into the beam
-    dispatch_topk_candidate_sort_and_merge(
+    dispatch_beam_management(
         ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
         CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
