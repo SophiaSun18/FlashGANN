@@ -26,9 +26,15 @@
 #define WARP_SIZE 32
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
 
-#define GPU_HASH_BASE_BITLEN 11
+// Floor for the visited-hash capacity. The workload-derived size in
+// hash_bitlen_for_search_workload() is what normally decides; this only sets the minimum.
+#ifndef GPU_HASH_BASE_BITLEN
+#define GPU_HASH_BASE_BITLEN 8
+#endif
 #define GPU_FAST_BITONIC_TOPK_CAP 128
+#ifndef GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT
 #define GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT 0
+#endif
 
 #ifndef GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES
 #define GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES 32
@@ -133,6 +139,13 @@ __host__ __device__ inline bool topk_external_merge_scratch_needed(uint32_t inte
 
 __host__ __device__ inline uint32_t hash_bitlen_for_search_workload(
     uint32_t beam_size, uint32_t candidate_buffer_size, uint32_t reset_interval) {
+    // calibrated for beams 32–1024, candidate capacity 32, and a reset every 16 iterations.
+    if (beam_size >= 32u && beam_size <= 1024u &&
+        candidate_buffer_size == 32u && reset_interval == 16u) {
+        return beam_size <= 512u ? 10u : 11u;  // 1024 or 2048 slots
+    }
+
+    // uncalibrated shape: fall back to the worst-case bound
     const uint64_t required64 = static_cast<uint64_t>(beam_size) + static_cast<uint64_t>(candidate_buffer_size) * reset_interval;
     const uint32_t required = required64 > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(required64);
     uint32_t target_capacity = (required * 4u + 2u) / 3u;
@@ -744,7 +757,9 @@ __device__ __noinline__ void dispatch_topk_candidate_sort_and_merge(
 }
 
 /*-------------------------------------------- hash table --------------------------------------------*/
+#ifndef SMALL_HASH_RESET_INTERVAL
 #define SMALL_HASH_RESET_INTERVAL 16
+#endif
 
 __host__ __device__ inline uint32_t hashtable_getsize(const uint32_t bitlen) {
     return 1 << bitlen;
