@@ -1233,10 +1233,43 @@ static __device__ __forceinline__ const uint8_t *lut_tile(
 }
 
 /**
+ * @brief Sum one neighbor's lookup entries, reading its packed codes 16 bytes at a time.
+ *
+ * One 16-byte load holds 32 scan groups and replaces 16 byte loads. Only one chunk is live
+ * at a time, which bounds the registers it adds.
+ *
+ * @param lut query lookup table, 16 entries per scan group
+ * @param tile 16-byte aligned packed codes of the neighbor
+ * @param num_codebook scan groups of the neighbor, a multiple of 32
+ * @return unsigned sum of the looked-up entries
+ */
+static __device__ __forceinline__ uint32_t widesum(const uint8_t *lut, const uint8_t *tile, int num_codebook) {
+    const uint4 *chunks = reinterpret_cast<const uint4 *>(tile);
+    uint32_t sum = 0;
+#pragma unroll 1
+    for (int base = 0; base < num_codebook; base += 32) {
+        // [1] one load covers scan groups base .. base + 31
+        const uint4 chunk = __ldg(chunks + (base >> 5));
+        const uint32_t words[4] = {chunk.x, chunk.y, chunk.z, chunk.w};
+        const uint8_t *row = lut + (base << 4);
+
+        // [2] byte j holds scan group 2j in its low nibble and 2j + 1 in its high nibble
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t packed = (words[j >> 2] >> ((j & 3) << 3)) & 0xffu;
+            sum += row[(j << 5) + (packed & 0x0fu)];
+            sum += row[(j << 5) + 16 + (packed >> 4)];
+        }
+    }
+    return sum;
+}
+
+/**
  * @brief Reduce one neighbor's packed codes against a query lookup table.
  *
  * Lanes within a group split the scan groups and reduce; only group lane 0 holds the
- * result. Returns the sign-corrected sum consumed by the distance expression.
+ * result. Returns the sign-corrected sum consumed by the distance expression. A lone lane
+ * on contiguous, 16-byte aligned codes reads them through widesum.
  *
  * @tparam LANES lanes cooperating on one neighbor
  * @tparam CODEBITS bits per dimension of this code block
@@ -1258,10 +1291,19 @@ static __device__ __forceinline__ float lut_reduce(
     int in_tile = 0;
     const uint8_t *tile = lut_tile(code_block, neighbor_idx, bytes_per_neighbor, &in_tile);
 
+    bool wide = false;
+    if constexpr (LANES == 1 && GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES == 32) {
+        wide = ((reinterpret_cast<uintptr_t>(tile) | static_cast<uintptr_t>(bytes_per_neighbor)) & 15u) == 0;
+    }
+
     uint32_t raw_sum = 0;
-    for (int cb = group_lane; cb < num_codebook; cb += LANES) {
-        const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(tile, cb, in_tile);
-        raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+    if (wide) {
+        raw_sum = widesum(qf.lut, tile, num_codebook);
+    } else {
+        for (int cb = group_lane; cb < num_codebook; cb += LANES) {
+            const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(tile, cb, in_tile);
+            raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+        }
     }
 
     if constexpr (LANES > 1) {
