@@ -1233,17 +1233,32 @@ static __device__ __forceinline__ const uint8_t *lut_tile(
 }
 
 /**
+ * @brief Load one lookup-table byte through its 32-bit shared-memory address.
+ *
+ * The table pointer is read from a shared QueryFactors, so the compiler cannot prove it
+ * points to shared memory and would emit a generic load with a 64-bit address.
+ *
+ * @param addr shared-window address of the byte
+ * @return the byte, zero-extended
+ */
+static __device__ __forceinline__ uint32_t lutbyte(uint32_t addr) {
+    uint32_t value;
+    asm volatile("ld.shared.u8 %0, [%1];" : "=r"(value) : "r"(addr));
+    return value;
+}
+
+/**
  * @brief Sum one neighbor's lookup entries, reading its packed codes 16 bytes at a time.
  *
  * One 16-byte load holds 32 scan groups and replaces 16 byte loads. Only one chunk is live
  * at a time, which bounds the registers it adds.
  *
- * @param lut query lookup table, 16 entries per scan group
+ * @param lutaddr shared-window address of the query lookup table, 16 entries per scan group
  * @param tile 16-byte aligned packed codes of the neighbor
  * @param num_codebook scan groups of the neighbor, a multiple of 32
  * @return unsigned sum of the looked-up entries
  */
-static __device__ __forceinline__ uint32_t widesum(const uint8_t *lut, const uint8_t *tile, int num_codebook) {
+static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8_t *tile, int num_codebook) {
     const uint4 *chunks = reinterpret_cast<const uint4 *>(tile);
     uint32_t sum = 0;
 #pragma unroll 1
@@ -1251,14 +1266,14 @@ static __device__ __forceinline__ uint32_t widesum(const uint8_t *lut, const uin
         // [1] one load covers scan groups base .. base + 31
         const uint4 chunk = __ldg(chunks + (base >> 5));
         const uint32_t words[4] = {chunk.x, chunk.y, chunk.z, chunk.w};
-        const uint8_t *row = lut + (base << 4);
+        const uint32_t row = lutaddr + (static_cast<uint32_t>(base) << 4);
 
         // [2] byte j holds scan group 2j in its low nibble and 2j + 1 in its high nibble
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const uint32_t packed = (words[j >> 2] >> ((j & 3) << 3)) & 0xffu;
-            sum += row[(j << 5) + (packed & 0x0fu)];
-            sum += row[(j << 5) + 16 + (packed >> 4)];
+            sum += lutbyte(row + (j << 5) + (packed & 0x0fu));
+            sum += lutbyte(row + (j << 5) + 16 + (packed >> 4));
         }
     }
     return sum;
@@ -1273,7 +1288,7 @@ static __device__ __forceinline__ uint32_t widesum(const uint8_t *lut, const uin
  *
  * @tparam LANES lanes cooperating on one neighbor
  * @tparam CODEBITS bits per dimension of this code block
- * @param qf query factors carrying the table and the query sum
+ * @param qf query factors carrying the shared-memory table and the query sum
  * @param code_block base of the parent's packed codes
  * @param neighbor_idx neighbor position within the parent
  * @param padded_dim padded dimension
@@ -1296,13 +1311,14 @@ static __device__ __forceinline__ float lut_reduce(
         wide = ((reinterpret_cast<uintptr_t>(tile) | static_cast<uintptr_t>(bytes_per_neighbor)) & 15u) == 0;
     }
 
+    const uint32_t lutaddr = static_cast<uint32_t>(__cvta_generic_to_shared(qf.lut));
     uint32_t raw_sum = 0;
     if (wide) {
-        raw_sum = widesum(qf.lut, tile, num_codebook);
+        raw_sum = widesum(lutaddr, tile, num_codebook);
     } else {
         for (int cb = group_lane; cb < num_codebook; cb += LANES) {
             const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(tile, cb, in_tile);
-            raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+            raw_sum += lutbyte(lutaddr + (static_cast<uint32_t>(cb) << 4) + code);
         }
     }
 
