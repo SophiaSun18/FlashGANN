@@ -59,13 +59,6 @@ void QuantizedPrunedBeamSearch(
     float* width = high_val + 1;
     int32_t* sum_q = reinterpret_cast<int32_t*>(width + 1);
     char* tail_base = reinterpret_cast<char*>(sum_q + 1);
-    // reserve optional scratch space for large-beam top-k merge
-    INDEX_T* MERGED_TOPK_INDEX = nullptr;
-    DISTANCE_T* MERGED_TOPK_DISTANCE = nullptr;
-    if (topk_external_merge_scratch_needed(padded_beam_size, candidate_buffer_size)) {
-        MERGED_TOPK_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, padded_beam_size);
-        MERGED_TOPK_DISTANCE = allocate_shared_tail_array<DISTANCE_T>(tail_base, padded_beam_size);
-    }
     void* CANDIDATE_RADIX_SCRATCH = nullptr;
     if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
         using CandidateRadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
@@ -172,8 +165,7 @@ void QuantizedPrunedBeamSearch(
         // sort and merge existing candidates into the beam
         const uint32_t merge_candidate_count = candidate_buffer_size;
         dispatch_beam_management(
-            ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-            CANDIDATE_RADIX_SCRATCH, merge_candidate_count, padded_beam_size, (iter == 0));
+            ALL_INDEX, ALL_DISTANCE, CANDIDATE_RADIX_SCRATCH, merge_candidate_count, padded_beam_size, (iter == 0));
         __syncthreads();
 
         // clear the beam stall part and candidate buffer to avoid stale entries
@@ -510,8 +502,7 @@ void QuantizedPrunedBeamSearch(
 
     // merge the final candidate batch into the beam
     dispatch_beam_management(
-        ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-        CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, false);
+        ALL_INDEX, ALL_DISTANCE, CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
     hashtable_init(HASH_TABLE, bitlen);

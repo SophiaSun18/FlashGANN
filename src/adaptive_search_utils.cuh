@@ -174,11 +174,6 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += 3 * sizeof(float);                                 // qf low/high/width
     size += sizeof(int32_t);                                   // qf sum_q
     size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));
-    if (topk_external_merge_scratch_needed(padded_beam_size, candidate_buffer_size)) {
-        size += padded_beam_size * sizeof(INDEX_T);             // MERGED_TOPK_INDEX scratch
-        size = static_cast<size_t>(align_up_uintptr(size, alignof(DISTANCE_T)));
-        size += padded_beam_size * sizeof(DISTANCE_T);          // MERGED_TOPK_DISTANCE scratch
-    }
     if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
         size = static_cast<size_t>(align_up_uintptr(size, candidate_radix_sort_scratch_alignment()));
         size += candidate_radix_sort_scratch_bytes();           // candidate radix sort scratch

@@ -133,9 +133,6 @@ __host__ __device__ inline uint32_t effective_sort_beam_size(uint32_t beam_size)
     return beam_size;
 }
 
-__host__ __device__ inline bool topk_external_merge_scratch_needed(uint32_t internal_topk, uint32_t candidate_buffer_size) {
-    return GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || candidate_buffer_size > 256 || internal_topk > 256;
-}
 
 __host__ __device__ inline uint32_t hash_bitlen_for_search_workload(
     uint32_t beam_size, uint32_t candidate_buffer_size, uint32_t reset_interval) {
@@ -660,44 +657,83 @@ __device__ __noinline__ void topk_candidate_bitonic_sort_and_merge(
     }
 }
 
-__device__ inline int merge_path_partition(
-    const DISTANCE_T *a,
-    int a_count,
-    const DISTANCE_T *b,
-    int b_count,
-    int diag) {
-    int low = max(0, diag - b_count);
-    int high = min(diag, a_count);
-
-    while (low <= high) {
-        const int a_idx = (low + high) >> 1;
-        const int b_idx = diag - a_idx;
-
-        const DISTANCE_T a_left = (a_idx > 0) ? a[a_idx - 1] : -FLT_MAX;
-        const DISTANCE_T a_right = (a_idx < a_count) ? a[a_idx] : FLT_MAX;
-        const DISTANCE_T b_left = (b_idx > 0) ? b[b_idx - 1] : -FLT_MAX;
-        const DISTANCE_T b_right = (b_idx < b_count) ? b[b_idx] : FLT_MAX;
-
-        if (a_left > b_right) {
-            high = a_idx - 1;
-        } else if (b_left > a_right) {
-            low = a_idx + 1;
+/**
+ * @brief Beam entries among the first `diag` outputs of the stable merge, beam first on ties.
+ *
+ * A lower-bound search on a monotone predicate, so every diagonal gets the same canonical
+ * split even through runs of equal distances.
+ *
+ * @param beam sorted beam distances
+ * @param topk beam length
+ * @param cand sorted candidate distances
+ * @param count candidate run length
+ * @param diag output position
+ * @return beam entries before that position
+ */
+static __device__ __forceinline__ int mergesplit(
+    const DISTANCE_T *beam, int topk, const DISTANCE_T *cand, int count, int diag) {
+    int low = max(0, diag - count);
+    int high = min(diag, topk);
+    while (low < high) {
+        const int mid = (low + high) >> 1;
+        if (beam[mid] <= cand[diag - 1 - mid]) {
+            low = mid + 1;
         } else {
-            return a_idx;
+            high = mid;
         }
     }
-
     return low;
 }
 
+/**
+ * @brief Merge the sorted candidate run into the sorted beam in place, one output per thread.
+ *
+ * Output o comes from beam position at most o, so windows of blockDim outputs are merged from
+ * the end of the beam backwards: a window reads only positions below the windows already
+ * written, and writes only positions the remaining windows never read. One barrier per window
+ * replaces the scratch copy of the beam.
+ *
+ * @param indices beam indices, followed by the candidate indices
+ * @param distances beam distances, followed by the candidate distances
+ * @param candidates candidate run length
+ * @param topk beam length
+ */
+static __device__ inline void mergepath(
+    INDEX_T *indices, DISTANCE_T *distances, uint32_t candidates, uint32_t topk) {
+    const INDEX_T *candindex = indices + topk;
+    const DISTANCE_T *canddist = distances + topk;
+    const int total = static_cast<int>(topk);
+    const int count = static_cast<int>(candidates);
+    const int wide = static_cast<int>(blockDim.x);
+    for (int base = ((total - 1) / wide) * wide; base >= 0; base -= wide) {
+        // [1] pick this thread's output while the positions it depends on are still unwritten
+        const int out = base + static_cast<int>(threadIdx.x);
+        INDEX_T keepindex = MAX_INDEX;
+        DISTANCE_T keepdist = FLT_MAX;
+        if (out < total) {
+            const int top = mergesplit(distances, total, canddist, count, out);
+            const int cand = out - top;
+            const bool fromtop = cand >= count || (top < total && distances[top] <= canddist[cand]);
+            keepdist = fromtop ? distances[top] : canddist[cand];
+            keepindex = fromtop ? indices[top] : candindex[cand];
+        }
+        __syncthreads();
+
+        // [2] the next window reads only below base, so this write overlaps its reads safely
+        if (out < total) {
+            distances[out] = keepdist;
+            indices[out] = keepindex;
+        }
+    }
+    __syncthreads();
+}
+
 // Sort candidates with the known warp-bitonic capacity N_1, then merge into the sorted beam.
-// Uses block merge-path and external scratch; selected for beams above 256.
+// Uses the in-place block merge-path; selected for beams above 256.
 template <unsigned N_1>
 __device__ __noinline__ void dispatch_topk_candidate_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk) {
     auto candidate_indices = result_indices_ptr + internal_topk;
@@ -706,54 +742,7 @@ __device__ __noinline__ void dispatch_topk_candidate_sort_and_merge(
     candidate_by_bitonic_sort<N_1, 0>(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
     __syncthreads();
 
-    constexpr int kItemsPerThread = 4;
-    int active_threads = (internal_topk + kItemsPerThread - 1) / kItemsPerThread;
-    active_threads = min(static_cast<int>(blockDim.x),
-                         ((active_threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
-
-    if (threadIdx.x < active_threads) {
-        const int out_begin =
-            min(internal_topk, (static_cast<int>(threadIdx.x) * internal_topk) / active_threads);
-        const int out_end =
-            min(internal_topk, (static_cast<int>(threadIdx.x + 1) * internal_topk) / active_threads);
-
-        const int top_begin = merge_path_partition(
-            result_distances_ptr, static_cast<int>(internal_topk),
-            candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
-            out_begin);
-        const int top_end = merge_path_partition(
-            result_distances_ptr, static_cast<int>(internal_topk),
-            candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
-            out_end);
-
-        int top_i = top_begin;
-        int cand_i = out_begin - top_begin;
-        const int cand_end = out_end - top_end;
-
-        for (int out_i = out_begin; out_i < out_end; ++out_i) {
-            const bool take_topk =
-                (cand_i >= cand_end) ||
-                (top_i < top_end &&
-                 result_distances_ptr[top_i] <= candidate_distances[cand_i]);
-
-            if (take_topk) {
-                merged_topk_dist_shared[out_i] = result_distances_ptr[top_i];
-                merged_topk_index_shared[out_i] = result_indices_ptr[top_i];
-                ++top_i;
-            } else {
-                merged_topk_dist_shared[out_i] = candidate_distances[cand_i];
-                merged_topk_index_shared[out_i] = candidate_indices[cand_i];
-                ++cand_i;
-            }
-        }
-    }
-    __syncthreads();
-
-    for (unsigned i = threadIdx.x; i < internal_topk; i += blockDim.x) {
-        result_distances_ptr[i] = merged_topk_dist_shared[i];
-        result_indices_ptr[i] = merged_topk_index_shared[i];
-    }
-    __syncthreads();
+    mergepath(result_indices_ptr, result_distances_ptr, CANDIDATE_BUFFER_SIZE, internal_topk);
 }
 
 /*-------------------------------------------- hash table --------------------------------------------*/
@@ -1410,13 +1399,11 @@ __device__ inline void dispatch_candidate_sort(
     }
 }
 
-// Dispatch candidate sorting at runtime, then merge into the sorted beam using external scratch.
+// Dispatch candidate sorting at runtime, then merge into the sorted beam in place.
 // General fallback for candidates above 256 or forced block sorting, regardless of beam size.
 static __device__ inline void dispatch_topk_candidate_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
     void *candidate_radix_scratch,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk) {
@@ -1427,54 +1414,7 @@ static __device__ inline void dispatch_topk_candidate_sort_and_merge(
                                     candidate_radix_scratch);
     __syncthreads();
 
-    constexpr int kItemsPerThread = 4;
-    int active_threads = (internal_topk + kItemsPerThread - 1) / kItemsPerThread;
-    active_threads = min(static_cast<int>(blockDim.x),
-                         ((active_threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
-
-    if (threadIdx.x < active_threads) {
-        const int out_begin =
-            min(static_cast<int>(internal_topk), (static_cast<int>(threadIdx.x) * static_cast<int>(internal_topk)) / active_threads);
-        const int out_end =
-            min(static_cast<int>(internal_topk), (static_cast<int>(threadIdx.x + 1) * static_cast<int>(internal_topk)) / active_threads);
-
-        const int top_begin = merge_path_partition(
-            result_distances_ptr, static_cast<int>(internal_topk),
-            candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
-            out_begin);
-        const int top_end = merge_path_partition(
-            result_distances_ptr, static_cast<int>(internal_topk),
-            candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
-            out_end);
-
-        int top_i = top_begin;
-        int cand_i = out_begin - top_begin;
-        const int cand_end = out_end - top_end;
-
-        for (int out_i = out_begin; out_i < out_end; ++out_i) {
-            const bool take_topk =
-                (cand_i >= cand_end) ||
-                (top_i < top_end &&
-                 result_distances_ptr[top_i] <= candidate_distances[cand_i]);
-
-            if (take_topk) {
-                merged_topk_dist_shared[out_i] = result_distances_ptr[top_i];
-                merged_topk_index_shared[out_i] = result_indices_ptr[top_i];
-                ++top_i;
-            } else {
-                merged_topk_dist_shared[out_i] = candidate_distances[cand_i];
-                merged_topk_index_shared[out_i] = candidate_indices[cand_i];
-                ++cand_i;
-            }
-        }
-    }
-    __syncthreads();
-
-    for (unsigned i = threadIdx.x; i < internal_topk; i += blockDim.x) {
-        result_distances_ptr[i] = merged_topk_dist_shared[i];
-        result_indices_ptr[i] = merged_topk_index_shared[i];
-    }
-    __syncthreads();
+    mergepath(result_indices_ptr, result_distances_ptr, CANDIDATE_BUFFER_SIZE, internal_topk);
 }
 
 // For a known warp-bitonic candidate capacity N_1, select beam capacity 32/64/128/256.
@@ -1483,8 +1423,6 @@ template <unsigned N_1>
 __device__ inline void dispatch_bitonic_beam_width(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
@@ -1507,7 +1445,6 @@ __device__ inline void dispatch_bitonic_beam_width(
     } else {
         dispatch_topk_candidate_sort_and_merge<N_1>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk);
     }
 }
@@ -1517,8 +1454,6 @@ __device__ inline void dispatch_bitonic_beam_width(
 __device__ inline void dispatch_beam_management(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
-    INDEX_T *merged_topk_index_shared,
-    DISTANCE_T *merged_topk_dist_shared,
     void *candidate_radix_scratch,
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
@@ -1527,32 +1462,27 @@ __device__ inline void dispatch_beam_management(
     if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT) {
         dispatch_topk_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared, candidate_radix_scratch,
+            candidate_radix_scratch,
             candidate_buffer_size, internal_topk);
     } else if (items_per_thread <= 1) {
         dispatch_bitonic_beam_width<1>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 2) {
         dispatch_bitonic_beam_width<2>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 4) {
         dispatch_bitonic_beam_width<4>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else if (items_per_thread <= 8) {
         dispatch_bitonic_beam_width<8>(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_buffer_size, internal_topk, first);
     } else {
         dispatch_topk_candidate_sort_and_merge(
             result_indices_ptr, result_distances_ptr,
-            merged_topk_index_shared, merged_topk_dist_shared,
             candidate_radix_scratch, candidate_buffer_size, internal_topk);
     }
 }
