@@ -2,7 +2,13 @@
 
 #include "adaptive_search_utils.cuh"
 
-/** SHAME(TALLFUNC) SHAME(MANYARG) */
+/**
+ * @brief Quantizer-pruned beam search.
+ *
+ * @tparam CODEBITS quantizer code width
+ * @tparam turbop whether the index carries a TurboQuant sketch
+ * SHAME(TALLFUNC) SHAME(MANYARG)
+ */
 template <int CODEBITS, bool turbop>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedPrunedBeamSearch(
@@ -43,27 +49,26 @@ void QuantizedPrunedBeamSearch(
     DISTANCE_T* PARENT_DISTANCE_LIST = reinterpret_cast<DISTANCE_T*>(PARENT_NODE_LIST + SEARCH_WIDTH);
     DATA_T* QUERY_BUFFER = reinterpret_cast<DATA_T*>(PARENT_DISTANCE_LIST + SEARCH_WIDTH);
 
-    float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
-    uint8_t* LUT_BUFFER = reinterpret_cast<uint8_t*>(ROTATED_QUERY_BUFFER + padded_dim);
-    uint8_t* lut_end = LUT_BUFFER + quant_lutbytes(padded_dim, CODEBITS);
-    float* SKETCH_QUERY_BUFFER = nullptr;
+    char* tail_base = reinterpret_cast<char*>(QUERY_BUFFER + dim);
+    uint8_t* LUT_BUFFER = reinterpret_cast<uint8_t*>(
+        allocate_shared_tail_array<uint4>(tail_base, quant_lutbytes(padded_dim, CODEBITS) >> 4));
     uint8_t* SIGN_LUT_BUFFER = nullptr;
     if constexpr (turbop) {
-        SKETCH_QUERY_BUFFER = reinterpret_cast<float*>(lut_end);
-        SIGN_LUT_BUFFER = reinterpret_cast<uint8_t*>(SKETCH_QUERY_BUFFER + padded_dim);
-        lut_end = SIGN_LUT_BUFFER + quant_lutbytes(padded_dim, 1);
+        SIGN_LUT_BUFFER = reinterpret_cast<uint8_t*>(
+            allocate_shared_tail_array<uint4>(tail_base, quant_lutbytes(padded_dim, 1) >> 4));
     }
-    char* query_factor_base = reinterpret_cast<char*>(lut_end);
-    float* low_val = reinterpret_cast<float*>(query_factor_base);
-    float* high_val = low_val + 1;
-    float* width = high_val + 1;
-    int32_t* sum_q = reinterpret_cast<int32_t*>(width + 1);
-    char* tail_base = reinterpret_cast<char*>(sum_q + 1);
+
+    // the rotated and sketch queries live only through query preparation, the radix scratch only
+    // through a merge, so both share one region
+    char* transient = reinterpret_cast<char*>(allocate_shared_tail_array<uint4>(tail_base, 0));
+    float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(transient);
+    float* SKETCH_QUERY_BUFFER = turbop ? ROTATED_QUERY_BUFFER + padded_dim : nullptr;
     void* CANDIDATE_RADIX_SCRATCH = nullptr;
     if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
         using CandidateRadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, 8, INDEX_T>;
+        char* radix_base = transient;
         CANDIDATE_RADIX_SCRATCH = allocate_shared_tail_array<typename CandidateRadixSort::TempStorage>(
-            tail_base, 1);
+            radix_base, 1);
     }
 
     __shared__ QueryFactors qf;

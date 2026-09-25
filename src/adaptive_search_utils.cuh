@@ -163,20 +163,21 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += SEARCH_WIDTH * sizeof(INDEX_T);                    // PARENT_NODE_LIST: graph node ids for selected parents
     size += SEARCH_WIDTH * sizeof(DISTANCE_T);                 // PARENT_DISTANCE_LIST: exact distances for selected parents
     size += dim * sizeof(DATA_T);                              // QUERY_BUFFER
-    size += padded_dim * sizeof(float);                        // ROTATED_QUERY_BUFFER
     const bool prod = quant == QUANT_TBQ;
     const int stage_bits = prod ? quant_stage(bits) : bits;
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(uint4)));
     size += quant_lutbytes(padded_dim, stage_bits) * sizeof(uint8_t); // LUT_BUFFER
     if (prod) {
-        size += padded_dim * sizeof(float);                     // SKETCH_QUERY_BUFFER
         size += quant_lutbytes(padded_dim, 1) * sizeof(uint8_t); // SIGN_LUT_BUFFER
     }
-    size += 3 * sizeof(float);                                 // qf low/high/width
-    size += sizeof(int32_t);                                   // qf sum_q
-    size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));
+    // one region for buffers never live together: rotated (+ sketch) query, radix scratch
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(uint4)));
+    size_t transient = padded_dim * sizeof(float) * (prod ? 2 : 1); // ROTATED_QUERY_BUFFER (+ SKETCH)
     if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
-        size = static_cast<size_t>(align_up_uintptr(size, candidate_radix_sort_scratch_alignment()));
-        size += candidate_radix_sort_scratch_bytes();           // candidate radix sort scratch
+        const size_t radix = align_up_uintptr(size, candidate_radix_sort_scratch_alignment()) - size
+            + candidate_radix_sort_scratch_bytes();             // candidate radix sort scratch
+        transient = transient > radix ? transient : radix;
     }
+    size += transient;
     return static_cast<uint32_t>(size);
 }
