@@ -72,8 +72,6 @@ void QuantizedPrunedBeamSearch(
         CANDIDATE_RADIX_SCRATCH = allocate_shared_tail_array<typename CandidateRadixSort::TempStorage>(
             tail_base, 1);
     }
-    // per-lane kept children carried from the pruning waves to the insert waves
-    INDEX_T* KEEP_INDEX = allocate_shared_tail_array<INDEX_T>(tail_base, scratchsize(static_cast<uint32_t>(max_degree)));
 
     __shared__ QueryFactors qf;
     __shared__ QueryFactors qb;
@@ -464,19 +462,10 @@ void QuantizedPrunedBeamSearch(
                     effective_keep_count = keep_count_for_expander(active_neighbors, adaptive_state, kth_cutoff_valid, __popc(near_cutoff_mask));
                 }
                 const bool keep_lane = keep_all_valid ? valid_candidate : warp_keep_topk_smallest_f32(est_dist, valid_candidate, effective_keep_count);
-                if (task_active) {
-                    KEEP_INDEX[task * WARP_SIZE + lane_id] = keep_lane ? child_id : MAX_INDEX;
-                }
-            }
-            // every wave finishes its visited check and pruning before any wave inserts
-            __syncthreads();
-
-            // insert kept children wave by wave and compact accepted lanes into the candidate buffer
-            for (int task_base = 0; task_base < task_count; task_base += WARPS_PER_BLOCK) {
-                const int task = task_base + warp_id;
-                const INDEX_T child_id = (task < task_count) ? KEEP_INDEX[task * WARP_SIZE + lane_id] : MAX_INDEX;
+                // every warp finishes this wave's visited check before any warp inserts
+                __syncthreads();
                 uint32_t inserted = 0;
-                if (child_id != MAX_INDEX) {
+                if (keep_lane) {
                     inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
                 }
 
@@ -495,8 +484,9 @@ void QuantizedPrunedBeamSearch(
                         CANDIDATE_DISTANCE[slot] = FLT_MAX;
                     }
                 }
+                // every warp finishes this wave's inserts before the next wave checks
+                __syncthreads();
             }
-            __syncthreads();
 
             if (tid == 0 && compact_candidate_count > candidate_collect_capacity) {
                 compact_candidate_count = candidate_collect_capacity;
