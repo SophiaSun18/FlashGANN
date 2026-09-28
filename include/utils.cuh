@@ -599,6 +599,7 @@ __device__ __noinline__ void topk_candidate_bitonic_sort_and_merge(
             candidate_indices[j] = val_1[i];
         }
     }
+    __syncwarp();
 
     // Sort part 2
     // constexpr unsigned N_2 = 4;

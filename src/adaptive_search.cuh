@@ -190,16 +190,13 @@ void QuantizedPrunedBeamSearch(
             hashtable_init(HASH_TABLE, bitlen);
             __syncthreads();
             hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
+            __syncthreads();
         }
-        __syncthreads();
-        if (tid == 0) {
-            compact_candidate_count = 0;
-            current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
-        }
-        __syncthreads();
 
         // update adaptive parameters before expander selection
         if (tid == 0) {
+            compact_candidate_count = 0;
+            current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
             INDEX_T current_top1 = MAX_INDEX;
             const int head_stall_iters = update_head_stall_counter(TOP_K_INDEX, adaptive_state, &current_top1);
             const bool phase_changed = adaptive_state.warmup_done || head_stall_iters >= static_cast<int>(TOP1_WARMUP_STALL_ITERS);
@@ -223,33 +220,30 @@ void QuantizedPrunedBeamSearch(
                 }
             }
         }
-        __syncthreads();
+        __syncwarp();
 
         // select expanders from the current beam based on the adaptive speculation degree
         if (warp_id == 0) {
             keep_expanding = pick_expanders(adaptive_state.adaptive_spec_degree, PARENT_LIST, beam_sz, TOP_K_INDEX);
+            __syncwarp();
+            // record how many expanders are selected for this iteration
+            const int filled = min(static_cast<int>(keep_expanding), static_cast<int>(SEARCH_WIDTH));
+            for (int p = lane_id; p < filled; p += WARP_SIZE) {
+                const uint32_t parent_pos = PARENT_LIST[p];
+                const INDEX_T parent_node = TOP_K_INDEX[parent_pos] & 0x7fffffffu;
+                PARENT_NODE_LIST[p] = parent_node;
+                PARENT_DISTANCE_LIST[p] = TOP_K_DISTANCE[parent_pos];
+            }
+            __syncwarp();
+            if (lane_id == 0 && keep_expanding) {
+                record_selected_expander_dist(keep_expanding, PARENT_DISTANCE_LIST, &adaptive_state);
+            }
         }
         __syncthreads();
 
         if (!keep_expanding) {
             break;
         }
-
-        // collect the expanders into the parent list along with their exact distance
-        for (int p = tid; p < SEARCH_WIDTH; p += blockDim.x) {
-            if (p < static_cast<int>(keep_expanding)) {
-                const uint32_t parent_pos = PARENT_LIST[p];
-                const INDEX_T parent_node = TOP_K_INDEX[parent_pos] & 0x7fffffffu;
-                PARENT_NODE_LIST[p] = parent_node;
-                PARENT_DISTANCE_LIST[p] = TOP_K_DISTANCE[parent_pos];
-            }
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            record_selected_expander_dist(keep_expanding, PARENT_DISTANCE_LIST, &adaptive_state);
-        }
-        __syncthreads();
 
         // use shared-memory pruning for one expander, or warp-local pruning for multiple expanders
         const bool use_local_gate = adaptive_state.adaptive_spec_degree > 1;
