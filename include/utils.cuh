@@ -266,8 +266,35 @@ static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
     return warp_counts[0];
 }
 
+/**
+ * @brief Whether this lane holds one of the keep_k smallest valid values, lower lane first on ties.
+ *
+ * @param value this lane's value
+ * @param valid whether this lane takes part
+ * @param keep_k number of values to keep
+ * @return whether this lane is kept
+ */
 static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) {
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    // [1] order-preserving key; + 0.0f folds -0.0f into +0.0f, invalid lanes take the largest key
+    const uint32_t bits = __float_as_uint(value + 0.0f);
+    const uint32_t flip = (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    uint32_t key = valid ? (bits ^ flip) : 0xffffffffu;
+    const int picks = min(keep_k, __popc(__ballot_sync(FULL_MASK, valid)));
+
+    // [2] each round keeps the lowest lane that holds the smallest remaining key
+    bool kept = false;
+    for (int round = 0; round < picks; ++round) {
+        const uint32_t smallest = __reduce_min_sync(FULL_MASK, key);
+        const uint32_t owners = __ballot_sync(FULL_MASK, key == smallest);
+        if (lane_id == __ffs(owners) - 1) {
+            kept = true;
+            key = 0xffffffffu;
+        }
+    }
+    return kept;
+#else
     const int valid_int = valid ? 1 : 0;
     const float my_value = valid ? value : FLT_MAX;
     int rank = 0;
@@ -282,6 +309,7 @@ static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, 
     }
 
     return valid && keep_k > 0 && rank < keep_k;
+#endif
 }
 
 /*-------------------------------------------- distance --------------------------------------------*/
