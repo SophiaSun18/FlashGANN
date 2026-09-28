@@ -1497,10 +1497,6 @@ __device__ inline void dispatch_bitonic_beam_width(
         topk_candidate_bitonic_sort_and_merge<N_1, 4>(
             result_indices_ptr, result_distances_ptr,
             candidate_buffer_size, internal_topk, first);
-    } else if (internal_topk <= 256) {
-        topk_candidate_bitonic_sort_and_merge<N_1, 8>(
-            result_indices_ptr, result_distances_ptr,
-            candidate_buffer_size, internal_topk, first);
     } else {
         dispatch_topk_candidate_sort_and_merge<N_1>(
             result_indices_ptr, result_distances_ptr,
