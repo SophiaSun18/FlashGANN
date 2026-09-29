@@ -10,6 +10,7 @@ void PathWBeamSearch(
     const T* __restrict__ d_data,
     const uint32_t* __restrict__ d_sign_bit,
     vidType* __restrict__ d_results,
+    float* __restrict__ d_result_dists,
     uint32_t* d_iters,
     vidType entry_point, GraphGPU gg,
     float neighbor_keep_ratio, float iteration_prune_ratio, bool use_ip)
@@ -150,8 +151,10 @@ void PathWBeamSearch(
     dispatch_beam_management(result_indices_buffer, result_distances_buffer, nullptr,
                              candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
-    for (uint32_t i = tid; i < static_cast<uint32_t>(K); i += blockDim.x)
+    for (uint32_t i = tid; i < static_cast<uint32_t>(K); i += blockDim.x) {
         d_results[static_cast<size_t>(query_id) * K + i] = result_indices_buffer[i] & ~INDEX_MSB_1_MASK;
+        d_result_dists[static_cast<size_t>(query_id) * K + i] = result_distances_buffer[i];
+    }
     if (tid == 0) d_iters[query_id] = expanded;
 }
 

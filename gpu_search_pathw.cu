@@ -61,11 +61,11 @@ static auto pathw_kernel(int dim, int beam) {
 }
 
 template <typename T>
-void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_idx, int beam_sz,
-                                 const char* signbit_file,
+void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_idx, float* result_dist,
+                                 int beam_sz, const char* signbit_file,
                                  float neighbor_keep_ratio,
                                  float iteration_prune_ratio,
-                                 double& elapsed, uint32_t* iters, int repeat) {
+                                 double* elapsed, uint32_t* iters, int repeat) {
   auto dim = this->d;
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
@@ -121,6 +121,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   T* d_data = nullptr;
   T* h_data = this->get_data_ptr();
   vid_t* d_results = nullptr;
+  float* d_result_dists = nullptr;
   uint32_t* d_iters = nullptr;
   uint32_t* d_sign_bit = nullptr;
 
@@ -130,10 +131,11 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   const size_t query_bytes = static_cast<size_t>(active_nq) * dim * sizeof(T);
   const size_t data_bytes = static_cast<size_t>(npoints) * dim * sizeof(T);
   const size_t result_bytes = static_cast<size_t>(active_nq) * K * sizeof(vid_t);
+  const size_t result_dists_bytes = static_cast<size_t>(active_nq) * K * sizeof(float);
   const size_t sign_bytes = static_cast<size_t>(sign_n) * sign_width * sizeof(uint32_t);
   const size_t iters_bytes = static_cast<size_t>(active_nq) * sizeof(uint32_t);
   const size_t graph_bytes = this->edges.size() * sizeof(vid_t);
-  const size_t required_bytes = query_bytes + data_bytes + result_bytes + sign_bytes + graph_bytes + iters_bytes;
+  const size_t required_bytes = query_bytes + data_bytes + result_bytes + result_dists_bytes + sign_bytes + graph_bytes + iters_bytes;
   constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
   printf("GPU memory: free=%.2f GiB, total=%.2f GiB, required=%.2f GiB (data=%.2f GiB, signbit=%.2f GiB)\n",
          static_cast<double>(free_mem_bytes) / kBytesPerGiB,
@@ -146,13 +148,17 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   }
 
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_queries, query_bytes));
+  CUDA_SAFE_CALL(cudaDeviceSynchronize());
   const auto query_load_start = std::chrono::high_resolution_clock::now();
   CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, query_bytes, cudaMemcpyHostToDevice));
+  CUDA_SAFE_CALL(cudaDeviceSynchronize());
   const auto query_load_end = std::chrono::high_resolution_clock::now();
-  printf("Query H2D time: %.6f ms\n", std::chrono::duration<double, std::milli>(query_load_end - query_load_start).count());
+  elapsed[QG_TIMER_QUERY_TRANSFER] = std::chrono::duration<double>(query_load_end - query_load_start).count();
+  printf("Query H2D time: %.6f ms\n", elapsed[QG_TIMER_QUERY_TRANSFER] * 1000.0);
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_data, data_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_results, result_bytes));
+  CUDA_SAFE_CALL(cudaMalloc((void**)&d_result_dists, result_dists_bytes));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_sign_bit, sign_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_sign_bit, h_sign_bit.get(), sign_bytes, cudaMemcpyHostToDevice));
 
@@ -176,25 +182,31 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   printf("Max active blocks per SM = %d\n", numBlocksPerSM);
 
   printf("\nStarting GPU PathW search...\n");
-  elapsed = 0.0;
+  double total = 0.0;
   for (int launch = 0; launch < repeat; ++launch) {
     auto start = std::chrono::high_resolution_clock::now();
     kernel<<<num_blocks, num_threads, shm_size>>>(
         K, active_nq, dim, beam_size, bitlen, npoints, d_queries, d_data,
-        d_sign_bit, d_results, d_iters, search_entry_point, gg,
+        d_sign_bit, d_results, d_result_dists, d_iters, search_entry_point, gg,
         neighbor_keep_ratio, iteration_prune_ratio, use_ip);
     CUDA_SAFE_CALL(cudaGetLastError());
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
-    elapsed += std::chrono::duration<double>(end - start).count();
+    total += std::chrono::duration<double>(end - start).count();
   }
-  elapsed /= repeat;
+  elapsed[QG_TIMER_SEARCH] = total / repeat;
 
+  const auto result_copy_start = std::chrono::high_resolution_clock::now();
   CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, result_bytes, cudaMemcpyDeviceToHost));
+  CUDA_SAFE_CALL(cudaMemcpy(result_dist, d_result_dists, result_dists_bytes, cudaMemcpyDeviceToHost));
   if (iters) CUDA_SAFE_CALL(cudaMemcpy(iters, d_iters, iters_bytes, cudaMemcpyDeviceToHost));
+  CUDA_SAFE_CALL(cudaDeviceSynchronize());
+  const auto result_copy_end = std::chrono::high_resolution_clock::now();
+  elapsed[QG_TIMER_RESULT_COPY] = std::chrono::duration<double>(result_copy_end - result_copy_start).count();
   CUDA_SAFE_CALL(cudaFree(d_queries));
   CUDA_SAFE_CALL(cudaFree(d_data));
   CUDA_SAFE_CALL(cudaFree(d_results));
+  CUDA_SAFE_CALL(cudaFree(d_result_dists));
   CUDA_SAFE_CALL(cudaFree(d_sign_bit));
   CUDA_SAFE_CALL(cudaFree(d_iters));
   gg.release();

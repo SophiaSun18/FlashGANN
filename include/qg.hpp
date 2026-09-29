@@ -12,11 +12,6 @@
 #include "metric.hpp"
 #include "quant.hpp"
 
-inline constexpr int QG_TIMER_QUERY_TRANSFER = 0;
-inline constexpr int QG_TIMER_SEARCH = 1;
-inline constexpr int QG_TIMER_RESULT_COPY = 2;
-inline constexpr int QG_SHARD_TIMER_COUNT = 3;
-
 class QuantizationGraph {
 public:
     // Codebook layout: entry point followed by per-node raw vector, packed codes, factors, and neighbor IDs.

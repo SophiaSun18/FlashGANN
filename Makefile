@@ -41,11 +41,11 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 gpu_flashgann: main.cu gpu_search_adaptive.cu $(AP_HEADERS) | $(BIN_DIR)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=1 -o $@ main.cu gpu_search_adaptive.cu
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=1 -o $@ main.cu gpu_search_adaptive.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
 gpu_pathw: main.cu gpu_search_pathw.cu include/index.hpp src/pathw_search.cuh src/pathw_utils.cuh include/utils.cuh include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp include/quant.hpp | $(BIN_DIR)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=2 -o $@ main.cu gpu_search_pathw.cu
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=2 -o $@ main.cu gpu_search_pathw.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
 buildindex: tools/buildindex.cc $(BUILD_HEADERS) | $(BIN_DIR)
