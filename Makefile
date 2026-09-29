@@ -1,7 +1,8 @@
 NVCC      := nvcc
 ARCH      ?= sm_89
 CXXSTD    := c++20
-NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH) $(EXTRA_NVFLAGS)
+NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH) -Xcompiler -fopenmp $(EXTRA_NVFLAGS)
+NVLIBS    := -lgomp
 PTXAS_FLAGS := -Xptxas -v
 INCLUDES  := -I.
 BIN_DIR   := bin

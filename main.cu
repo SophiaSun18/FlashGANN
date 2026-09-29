@@ -1,7 +1,18 @@
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
+#include <cfloat>
+#include <chrono>
+#include <cmath>
+#include <exception>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <cuda_runtime.h>
+#include <omp.h>
 
 #include "include/data_io.hpp"
 #include "include/metric.hpp"
@@ -74,6 +85,64 @@ int main(int argc, char** argv) {
     std::string csv_file;
     std::string iters_file;
     int repeat = 1;
+};
+
+/**
+ * @brief Whether the argument is a positive decimal integer.
+ * @param s argument text
+ * @return true for a shard count
+ */
+static bool is_positive_integer(const char* s) {
+    if (s == nullptr || *s == '\0') return false;
+    for (const char* p = s; *p != '\0'; ++p) {
+        if (!std::isdigit(static_cast<unsigned char>(*p))) return false;
+    }
+    return atoi(s) > 0;
+}
+
+/**
+ * @brief Split a comma-separated path list.
+ * @param files the list
+ * @return the paths in order
+ */
+static std::vector<std::string> split_file_list(const std::string& files) {
+    std::vector<std::string> out;
+    size_t begin = 0;
+    while (begin <= files.size()) {
+        const size_t comma = files.find(',', begin);
+        const size_t end = (comma == std::string::npos) ? files.size() : comma;
+        if (end == begin) throw std::runtime_error("Empty path in comma-separated file list");
+        out.emplace_back(files.substr(begin, end - begin));
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    return out;
+}
+
+/**
+ * @brief Print both the sharded and the single-index command line.
+ * @param prog program name
+ */
+static void print_usage(const char* prog) {
+    fprintf(stderr,
+            "Usage: %s <num_shards> <data1.fvecs[,data2...]> <query.fvecs> <gt.ivecs> "
+            "<qg1.index[,qg2...]> [K=100] [beam_size=128] [degree=32] "
+            "[-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt] [-repeat n]\n"
+            "Legacy: %s <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> "
+            "[K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] "
+            "[-csv output.csv] [-iters output.txt] [-repeat n]\n",
+            prog, prog);
+}
+
+/**
+ * @brief Whether a shard result slot holds a real neighbor.
+ * @param id local neighbor id
+ * @param dist its distance
+ * @return true when the slot can take part in the merge
+ */
+static bool is_valid_merge_candidate(vidType id, float dist) {
+    return id != std::numeric_limits<vidType>::max() && std::isfinite(dist) && dist < FLT_MAX;
+}
 
     int arg_idx = input_arg + input_files;
     if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
@@ -85,9 +154,9 @@ int main(int argc, char** argv) {
     while (arg_idx < argc) {
         std::string arg = argv[arg_idx];
         if (arg == "-csv" && arg_idx + 1 < argc) {
-            csv_file = argv[++arg_idx];
+            cfg.csv_file = argv[++arg_idx];
         } else if (arg == "-iters" && arg_idx + 1 < argc) {
-            iters_file = argv[++arg_idx];
+            cfg.iters_file = argv[++arg_idx];
         } else if (arg == "-repeat" && arg_idx + 1 < argc) {
             repeat = atoi(argv[++arg_idx]);
             if (repeat < 1) repeat = 1;
@@ -110,10 +179,61 @@ int main(int argc, char** argv) {
 #endif
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
-            return 1;
+            return false;
         }
         ++arg_idx;
     }
+    return true;
+}
+
+/**
+ * @brief Parse the sharded form when argv[1] is a shard count, else the single-index form.
+ * @param argc argument count
+ * @param argv arguments
+ * @param cfg receives the options
+ * @return false when the arguments do not fit either form
+ */
+static bool parse_cli(int argc, char** argv, CliConfig& cfg) {
+    if (argc < 5) return false;
+
+    int arg_idx = 1;
+    if (is_positive_integer(argv[arg_idx])) {
+        if (argc < 6) return false;
+        cfg.total_shards = atoi(argv[arg_idx++]);
+    } else {
+        cfg.total_shards = 1;
+    }
+    cfg.data_files = split_file_list(argv[arg_idx++]);
+    cfg.query_file = argv[arg_idx++];
+    cfg.gt_file = argv[arg_idx++];
+    cfg.codebook_files = split_file_list(argv[arg_idx++]);
+
+    if (cfg.data_files.size() != static_cast<size_t>(cfg.total_shards)) {
+        fprintf(stderr, "Data partition count %zu does not match num_shards %d\n",
+                cfg.data_files.size(), cfg.total_shards);
+        return false;
+    }
+    if (cfg.codebook_files.size() != static_cast<size_t>(cfg.total_shards)) {
+        fprintf(stderr, "Codebook count %zu does not match num_shards %d\n",
+                cfg.codebook_files.size(), cfg.total_shards);
+        return false;
+    }
+    return parse_common_args(argc, argv, arg_idx, cfg);
+}
+
+int main(int argc, char** argv) {
+    CliConfig cfg;
+    try {
+        if (!parse_cli(argc, argv, cfg)) {
+            print_usage(argv[0]);
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Error: %s\n", e.what());
+        print_usage(argv[0]);
+        return 1;
+    }
+
     printf("========================================\n");
     printf("GPU Beam Search Loading from:\nMode: %s\n", mode.c_str());
     printf("========================================\n");
@@ -200,39 +320,51 @@ int main(int argc, char** argv) {
                            repeat, beam_size, elapsed);
 #endif
 
-    const float recall = compute_recall_dedup(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
-    const double latency_ms = (nq > 0) ? (elapsed * 1000.0 / static_cast<double>(nq)) : 0.0;
-    const double qps = (elapsed > 0.0) ? (static_cast<double>(nq) / elapsed) : 0.0;
+    printf("\n========================================\n");
+    printf("Timing Breakdown\n");
+    printf("========================================\n");
+    for (int shard = 0; shard < cfg.total_shards; ++shard) {
+        const size_t base_idx = static_cast<size_t>(shard) * QG_SHARD_TIMER_COUNT;
+        printf("Shard %d query transfer: %.6f ms\n",
+               shard, elapsed[base_idx + QG_TIMER_QUERY_TRANSFER] * 1000.0);
+        printf("Shard %d search: %.6f ms\n",
+               shard, elapsed[base_idx + QG_TIMER_SEARCH] * 1000.0);
+        printf("Shard %d result copy: %.6f ms\n",
+               shard, elapsed[base_idx + QG_TIMER_RESULT_COPY] * 1000.0);
+    }
+    printf("Global merge: %.6f ms\n", elapsed[merge_timer_idx] * 1000.0);
+    printf("Reported runtime (max shard search): %.6f ms\n", max_search_elapsed * 1000.0);
+    printf("========================================\n");
 
     printf("\n========================================\n");
     printf("Results\n");
     printf("========================================\n");
-    printf("Total time: %.6f ms\n", elapsed * 1000.0);
+    printf("Total time: %.6f ms\n", max_search_elapsed * 1000.0);
     printf("Throughput: %.6f queries/sec\n", qps);
     printf("Avg latency: %.6f ms/query\n", latency_ms);
-    printf("Recall@%d: %.6f\n", K, recall);
+    printf("Recall@%d: %.6f\n", cfg.K, recall);
     printf("========================================\n");
 
     RunStats run_stats;
-    run_stats.runtime = elapsed;
+    run_stats.runtime = max_search_elapsed;
     run_stats.latency = latency_ms;
     run_stats.throughput = qps;
     run_stats.recall = recall;
 
-    if (!csv_file.empty()) {
-        append_run_stats_to_csv(csv_file, K, beam_size, run_stats);
-        printf("Saved GPU stats CSV row to: %s\n", csv_file.c_str());
+    if (!cfg.csv_file.empty()) {
+        append_run_stats_to_csv(cfg.csv_file, cfg.K, cfg.beam_size, run_stats);
+        printf("Saved GPU stats CSV row to: %s\n", cfg.csv_file.c_str());
     }
 
-    if (!iters_file.empty()) {
-        FILE* fout = fopen(iters_file.c_str(), "w");
+    if (!cfg.iters_file.empty()) {
+        FILE* fout = fopen(cfg.iters_file.c_str(), "w");
         if (fout == nullptr) {
-            fprintf(stderr, "Cannot open iteration output: %s\n", iters_file.c_str());
+            fprintf(stderr, "Cannot open iteration output: %s\n", cfg.iters_file.c_str());
             return 1;
         }
-        for (uint32_t count : iters) fprintf(fout, "%u\n", count);
+        for (uint32_t count : merged_iters) fprintf(fout, "%u\n", count);
         fclose(fout);
-        printf("Saved per-query iterations to: %s\n", iters_file.c_str());
+        printf("Saved per-query iterations to: %s\n", cfg.iters_file.c_str());
     }
 
     return 0;

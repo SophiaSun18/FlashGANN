@@ -12,8 +12,8 @@
 
 typedef void (*SearchKernel)(int, int, int, int, int, int, size_t,
                              const float*, const float*, const float*, const float*, const float*,
-                             vidType*, uint32_t*, vidType, size_t, size_t, size_t, size_t, size_t,
-                             int, float, bool);
+                             vidType*, float*, uint32_t*, vidType, size_t, size_t, size_t, size_t,
+                             size_t, int, float, bool);
 
 /**
  * @brief Pick the beam search instantiation matching the index quantizer.
@@ -43,8 +43,8 @@ static SearchKernel select_kernel(QuantType quant, int bits) {
 }
 
 void QuantizationGraph::gpu_search_adaptive(
-    int nq, const float *queries, int K, vidType *result_idx, uint32_t *iters, int repeat,
-    int beam_sz, double &elapsed) {
+    int nq, const float *queries, int K, vidType *result_idx, float *result_dist, uint32_t *iters,
+    int repeat, int beam_sz, double *elapsed) {
     int padded_beam_size = static_cast<int>(effective_sort_beam_size(static_cast<uint32_t>(beam_sz)));
     const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * this->degree_;
     const size_t candidate_buffer_size = round_up_power2_u32(candidate_buffer_capacity(static_cast<uint32_t>(this->degree_)));
@@ -82,6 +82,7 @@ void QuantizationGraph::gpu_search_adaptive(
     float *d_qg_levels = nullptr;
     float *d_qg_sketch = nullptr;
     vidType *d_results = nullptr;
+    float *d_result_dists = nullptr;
     uint32_t *d_iters = nullptr;
     size_t free_mem_bytes = 0;
     size_t total_mem_bytes = 0;
@@ -89,10 +90,12 @@ void QuantizationGraph::gpu_search_adaptive(
 
     const size_t query_bytes = static_cast<size_t>(nq) * this->dim_ * sizeof(float);
     const size_t results_bytes = static_cast<size_t>(nq) * K * sizeof(vidType);
+    const size_t result_dists_bytes = static_cast<size_t>(nq) * K * sizeof(float);
     const size_t iters_bytes = static_cast<size_t>(nq) * sizeof(uint32_t);
     const size_t qg_data_bytes = this->get_data_bytes();
     const size_t qg_signs_bytes = this->get_signs_bytes();
-    const size_t required_bytes = query_bytes + results_bytes + iters_bytes + qg_data_bytes + qg_signs_bytes;
+    const size_t required_bytes = query_bytes + results_bytes + result_dists_bytes + iters_bytes +
+                                  qg_data_bytes + qg_signs_bytes;
 
     constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
     printf("GPU memory: free=%.2f GiB, total=%.2f GiB, required=%.2f GiB (qg_data=%.2f GiB, qg_signs=%.4f GiB)\n",
@@ -106,10 +109,13 @@ void QuantizationGraph::gpu_search_adaptive(
     }
 
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_queries, query_bytes));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
     const auto query_load_start = std::chrono::high_resolution_clock::now();
     CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, query_bytes, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
     const auto query_load_end = std::chrono::high_resolution_clock::now();
-    printf("Query Load Time: %.6f ms\n", std::chrono::duration<double, std::milli>(query_load_end - query_load_start).count());
+    elapsed[QG_TIMER_QUERY_TRANSFER] = std::chrono::duration<double>(query_load_end - query_load_start).count();
+    printf("Query Load Time: %.6f ms\n", elapsed[QG_TIMER_QUERY_TRANSFER] * 1000.0);
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_qg_data, qg_data_bytes));
     CUDA_SAFE_CALL(cudaMemcpy(d_qg_data, this->get_data_ptr(), qg_data_bytes, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_qg_signs, qg_signs_bytes));
@@ -125,6 +131,7 @@ void QuantizationGraph::gpu_search_adaptive(
                                   cudaMemcpyHostToDevice));
     }
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_results, results_bytes));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&d_result_dists, result_dists_bytes));
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_iters, iters_bytes));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -160,7 +167,8 @@ void QuantizationGraph::gpu_search_adaptive(
         auto start = std::chrono::high_resolution_clock::now();
         kernel<<<num_blocks, num_threads, shm_size>>>(
             K, nq, static_cast<int>(this->dim_), beam_sz, bitlen, static_cast<int>(this->degree_),
-            this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_sketch, d_qg_levels, d_results, d_iters,
+            this->num_nodes_, d_queries, d_qg_data, d_qg_signs, d_qg_sketch, d_qg_levels, d_results,
+            d_result_dists, d_iters,
             entry_point, this->get_row_offset(), this->get_neighbor_offset(),
             this->get_code_offset(), this->get_sign_offset(), this->get_factor_offset(),
             max_iter_by_beam, phase2_rho, this->get_metric() == METRIC_IP);
@@ -173,15 +181,21 @@ void QuantizationGraph::gpu_search_adaptive(
                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(wallstart.time_since_epoch()).count()),
                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(wallend.time_since_epoch()).count()));
     }
-    elapsed = total / repeat;
+    elapsed[QG_TIMER_SEARCH] = total / repeat;
 
+    const auto result_copy_start = std::chrono::high_resolution_clock::now();
     CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, results_bytes, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(result_dist, d_result_dists, result_dists_bytes, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(iters, d_iters, iters_bytes, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    const auto result_copy_end = std::chrono::high_resolution_clock::now();
+    elapsed[QG_TIMER_RESULT_COPY] = std::chrono::duration<double>(result_copy_end - result_copy_start).count();
     CUDA_SAFE_CALL(cudaFree(d_queries));
     CUDA_SAFE_CALL(cudaFree(d_qg_data));
     CUDA_SAFE_CALL(cudaFree(d_qg_signs));
     if (d_qg_levels != nullptr) CUDA_SAFE_CALL(cudaFree(d_qg_levels));
     if (d_qg_sketch != nullptr) CUDA_SAFE_CALL(cudaFree(d_qg_sketch));
     CUDA_SAFE_CALL(cudaFree(d_results));
+    CUDA_SAFE_CALL(cudaFree(d_result_dists));
     CUDA_SAFE_CALL(cudaFree(d_iters));
 }
