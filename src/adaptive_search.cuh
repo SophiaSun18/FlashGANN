@@ -7,7 +7,7 @@
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
- * SHAME(TALLFUNC) SHAME(MANYARG)
+ * SHAME(TALLFUNC) SHAME(WIDEFUNC) SHAME(MANYARG)
  */
 template <int CODEBITS, bool turbop>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
@@ -23,9 +23,6 @@ void QuantizedPrunedBeamSearch(
     if (query_id >= nq) return;
     const float* query = d_queries + query_id * dim;
 
-    const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_buffer_capacity(static_cast<uint32_t>(max_degree)));
     uint32_t candidate_collect_capacity = static_cast<uint32_t>(BUFFER_BOUND);
@@ -81,7 +78,7 @@ void QuantizedPrunedBeamSearch(
     __shared__ uint32_t warp_stat_counts[2 * WARPS_PER_BLOCK + 1];
 
     // initialize the query and search state
-    if (tid == 0) {
+    if (tidx() == 0) {
         qf.rotated_query = ROTATED_QUERY_BUFFER;
         qf.quantized_query = nullptr;
         qf.lut = LUT_BUFFER;
@@ -112,27 +109,27 @@ void QuantizedPrunedBeamSearch(
     hashtable_init(HASH_TABLE, bitlen);
 
     // initialize shared memory buffers for query, top-k, and candidate lists
-    for (int i = tid; i < dim; i += blockDim.x) {
+    for (int i = tidx(); i < dim; i += blockDim.x) {
         QUERY_BUFFER[i] = query[i];
     }
-    for (int i = tid; i < static_cast<int>(padded_beam_size); i += blockDim.x) {
+    for (int i = tidx(); i < static_cast<int>(padded_beam_size); i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
-    for (int i = tid; i < candidate_buffer_size; i += blockDim.x) {
+    for (int i = tidx(); i < candidate_buffer_size; i += blockDim.x) {
         CANDIDATE_INDEX[i] = MAX_INDEX;
         CANDIDATE_DISTANCE[i] = FLT_MAX;
     }
-    for (int i = tid; i < SEARCH_WIDTH; i += blockDim.x) {
+    for (int i = tidx(); i < SEARCH_WIDTH; i += blockDim.x) {
         PARENT_NODE_LIST[i] = MAX_INDEX;
         PARENT_DISTANCE_LIST[i] = FLT_MAX;
     }
     __syncthreads();
 
     // only the first slot in candidate list is actually initialized with valid entry point
-    if (warp_id == 0) {
+    if (warpidx() == 0) {
         DISTANCE_T entry_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(entry_point) * row_offset, use_ip);
-        if (lane_id == 0) {
+        if (laneidx() == 0) {
             CANDIDATE_INDEX[0] = entry_point;
             CANDIDATE_DISTANCE[0] = entry_dist;
             adaptive_state.entry_distance = entry_dist;
@@ -174,15 +171,15 @@ void QuantizedPrunedBeamSearch(
         __syncthreads();
 
         // clear the beam stall part and candidate buffer to avoid stale entries
-        for (uint32_t i = beam_sz + tid; i < padded_beam_size; i += blockDim.x) {
+        for (uint32_t i = beam_sz + tidx(); i < padded_beam_size; i += blockDim.x) {
             TOP_K_INDEX[i] = MAX_INDEX;
             TOP_K_DISTANCE[i] = FLT_MAX;
         }
-        for (int i = tid; i < candidate_buffer_size; i += blockDim.x) {
+        for (int i = tidx(); i < candidate_buffer_size; i += blockDim.x) {
             CANDIDATE_INDEX[i] = MAX_INDEX;
             CANDIDATE_DISTANCE[i] = FLT_MAX;
         }
-        for (int i = tid; i < SEARCH_WIDTH; i += blockDim.x) {
+        for (int i = tidx(); i < SEARCH_WIDTH; i += blockDim.x) {
             PARENT_NODE_LIST[i] = MAX_INDEX;
             PARENT_DISTANCE_LIST[i] = FLT_MAX;
         }
@@ -194,7 +191,7 @@ void QuantizedPrunedBeamSearch(
         }
 
         // update adaptive parameters before expander selection
-        if (tid == 0) {
+        if (tidx() == 0) {
             compact_candidate_count = 0;
             current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
             INDEX_T current_top1 = MAX_INDEX;
@@ -223,19 +220,19 @@ void QuantizedPrunedBeamSearch(
         __syncwarp();
 
         // select expanders from the current beam based on the adaptive speculation degree
-        if (warp_id == 0) {
+        if (warpidx() == 0) {
             keep_expanding = pick_expanders(adaptive_state.adaptive_spec_degree, PARENT_LIST, beam_sz, TOP_K_INDEX);
             __syncwarp();
             // record how many expanders are selected for this iteration
             const int filled = min(static_cast<int>(keep_expanding), static_cast<int>(SEARCH_WIDTH));
-            for (int p = lane_id; p < filled; p += WARP_SIZE) {
+            for (int p = laneidx(); p < filled; p += WARP_SIZE) {
                 const uint32_t parent_pos = PARENT_LIST[p];
                 const INDEX_T parent_node = TOP_K_INDEX[parent_pos] & 0x7fffffffu;
                 PARENT_NODE_LIST[p] = parent_node;
                 PARENT_DISTANCE_LIST[p] = TOP_K_DISTANCE[parent_pos];
             }
             __syncwarp();
-            if (lane_id == 0 && keep_expanding) {
+            if (laneidx() == 0 && keep_expanding) {
                 record_selected_expander_dist(keep_expanding, PARENT_DISTANCE_LIST, &adaptive_state);
             }
         }
@@ -255,7 +252,7 @@ void QuantizedPrunedBeamSearch(
             const vidType* parent_neighbors = parent_valid ? reinterpret_cast<const vidType*>(parent_row + neighbor_offset) : nullptr;
 
             // gather valid neighbors into shared memory
-            for (int i = tid; i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
+            for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
                 INDEX_T child_id = MAX_INDEX;
                 if (i < static_cast<int>(candidate_work_count) && parent_valid) {
                     child_id = parent_neighbors[i];
@@ -284,10 +281,10 @@ void QuantizedPrunedBeamSearch(
                 const int sign_bytes = static_cast<int>(quant_bytes(padded_dim, 1));
                 constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
                 constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
-                const int group_lane = lane_id & (lanes_per_neighbor - 1);
-                const int warp_group = lane_id / lanes_per_neighbor;
+                const int group_lane = laneidx() & (lanes_per_neighbor - 1);
+                const int warp_group = laneidx() / lanes_per_neighbor;
 
-                for (int base = warp_id * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
+                for (int base = warpidx() * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
                     const int i = base + warp_group;
                     bool valid_candidate = i < static_cast<int>(candidate_work_count) && CANDIDATE_INDEX[i] != MAX_INDEX;
                     DISTANCE_T est_dist = FLT_MAX;
@@ -319,21 +316,21 @@ void QuantizedPrunedBeamSearch(
                 // tighten the keep count using the current kth-result cutoff when available
                 const DISTANCE_T kth_cutoff = current_kth_cutoff;
                 const bool kth_cutoff_valid = isfinite(static_cast<float>(kth_cutoff)) && kth_cutoff < FLT_MAX;
-                if (tid == 0) {
+                if (tidx() == 0) {
                     shared_kth_near_count = 0;
                 }
                 __syncthreads();
 
                 if (kth_cutoff_valid) {
                     uint32_t thread_near_count = 0;
-                    for (int i = tid; i < static_cast<int>(candidate_work_count); i += blockDim.x) {
+                    for (int i = tidx(); i < static_cast<int>(candidate_work_count); i += blockDim.x) {
                         const DISTANCE_T dist = CANDIDATE_DISTANCE[i];
                         if (CANDIDATE_INDEX[i] != MAX_INDEX && isfinite(dist) && dist <= kth_cutoff) {
                             thread_near_count++;
                         }
                     }
                     const uint32_t block_near_count = block_reduce_sum_u32(thread_near_count, warp_stat_counts);
-                    if (tid == 0) shared_kth_near_count = block_near_count;
+                    if (tidx() == 0) shared_kth_near_count = block_near_count;
                 }
                 __syncthreads();
 
@@ -345,7 +342,7 @@ void QuantizedPrunedBeamSearch(
                     CANDIDATE_RADIX_SCRATCH);
                 __syncthreads();
 
-                for (int i = tid; i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
+                for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
                     if (i >= effective_keep_count) {
                         CANDIDATE_INDEX[i] = MAX_INDEX;
                         CANDIDATE_DISTANCE[i] = FLT_MAX;
@@ -356,10 +353,10 @@ void QuantizedPrunedBeamSearch(
 
             // insert kept children and compute their exact distances for the next merge
             const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : effective_keep_count;
-            for (int i = warp_id; i < admit_scan_count; i += WARPS_PER_BLOCK) {
+            for (int i = warpidx(); i < admit_scan_count; i += WARPS_PER_BLOCK) {
                 INDEX_T child_id = MAX_INDEX;
                 uint32_t inserted = 0;
-                if (lane_id == 0) {
+                if (laneidx() == 0) {
                     child_id = CANDIDATE_INDEX[i];
                     if (child_id != MAX_INDEX && CANDIDATE_DISTANCE[i] < FLT_MAX) {
                         inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
@@ -370,6 +367,8 @@ void QuantizedPrunedBeamSearch(
                         CANDIDATE_DISTANCE[i] = FLT_MAX;
                     }
                 }
+                // reconverge after lane 0's insert so the broadcasts compile to native shuffles
+                __syncwarp();
                 child_id = SHFL(child_id, 0);
                 inserted = SHFL(inserted, 0);
 
@@ -377,7 +376,7 @@ void QuantizedPrunedBeamSearch(
                 if (inserted) {
                     child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
                 }
-                if (lane_id == 0 && inserted) {
+                if (laneidx() == 0 && inserted) {
                     CANDIDATE_DISTANCE[i] = child_dist;
                 }
             }
@@ -388,6 +387,9 @@ void QuantizedPrunedBeamSearch(
 
             // scan parent-neighbor tiles against the visited set and record each lane's kept child
             for (int task_base = 0; task_base < task_count; task_base += WARPS_PER_BLOCK) {
+                // this wave's warp and lane, read afresh so they are not kept across the search loop
+                const int warp_id = warpidx();
+                const int lane_id = laneidx();
                 const int task = task_base + warp_id;
                 const bool task_active = task < task_count;
                 const uint32_t parent_idx = task_active ? static_cast<uint32_t>(task / tiles_per_parent) : 0u;
@@ -479,18 +481,18 @@ void QuantizedPrunedBeamSearch(
                 __syncthreads();
             }
 
-            if (tid == 0 && compact_candidate_count > candidate_collect_capacity) {
+            if (tidx() == 0 && compact_candidate_count > candidate_collect_capacity) {
                 compact_candidate_count = candidate_collect_capacity;
             }
             __syncthreads();
 
             // compute exact distances for compacted speculative candidates
             const uint32_t compact_count = compact_candidate_count;
-            for (int i = warp_id; i < static_cast<int>(compact_count); i += WARPS_PER_BLOCK) {
+            for (int i = warpidx(); i < static_cast<int>(compact_count); i += WARPS_PER_BLOCK) {
                 const INDEX_T child_id = CANDIDATE_INDEX[i];
                 DISTANCE_T child_dist = FLT_MAX;
                 child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
-                if (lane_id == 0) {
+                if (laneidx() == 0) {
                     CANDIDATE_DISTANCE[i] = child_dist;
                 }
             }
@@ -508,7 +510,7 @@ void QuantizedPrunedBeamSearch(
     __syncthreads();
 
     // write top-k results
-    if (tid == 0) {
+    if (tidx() == 0) {
         int output_count = 0;
         for (int i = 0; i < beam_sz && output_count < K; ++i) {
             const INDEX_T raw_result = TOP_K_INDEX[i];
