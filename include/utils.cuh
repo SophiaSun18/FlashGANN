@@ -264,7 +264,7 @@ static __device__ __forceinline__ uint32_t allocate_warp_compact_slots(
 template <typename INDEX_T, typename DISTANCE_T>
 static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
     const INDEX_T *candidate_index, const DISTANCE_T *candidate_distance,
-    int candidate_count, INDEX_T invalid_index, uint32_t *warp_counts) { // SHAME(WIDEFUNC)
+    int candidate_count, INDEX_T invalid_index, uint32_t *warp_counts) {
     const int lane_id = tidx() & (WARP_SIZE - 1);
     const int warp_id = tidx() / WARP_SIZE;
 
@@ -304,7 +304,7 @@ static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
  * @param keep_k number of values to keep
  * @return whether this lane is kept
  */
-static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) { // SHAME(WIDEFUNC)
+static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) {
     const int lane_id = tidx() & (WARP_SIZE - 1);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     // [1] order-preserving key; + 0.0f folds -0.0f into +0.0f, invalid lanes take the largest key
@@ -333,6 +333,80 @@ static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, 
         const float other_value = __shfl_sync(FULL_MASK, my_value, src);
         const int other_valid = __shfl_sync(FULL_MASK, valid_int, src);
         if (other_valid && (other_value < my_value || (other_value == my_value && src < lane_id))) {
+            rank++;
+        }
+    }
+
+    return valid && keep_k > 0 && rank < keep_k;
+#endif
+}
+
+/**
+ * @brief Whether one of this lane's two values is among the keep_k smallest of the warp's 64.
+ *
+ * Lane l holds positions l and l + 32; lower position first on ties.
+ *
+ * @param value the value asked about, value0 or value1
+ * @param valid whether that value takes part
+ * @param position its position, lane or lane + 32
+ * @param value0 this lane's value at position lane
+ * @param valid0 whether value0 takes part
+ * @param value1 this lane's value at position lane + 32
+ * @param valid1 whether value1 takes part
+ * @param keep_k number of values to keep
+ * @return whether the value is kept
+ */
+static __device__ __forceinline__ bool warp_keep_topk_smallest_pair_f32(
+    float value, bool valid, int position,
+    float value0, bool valid0, float value1, bool valid1, int keep_k) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+    // [1] order-preserving keys as in warp_keep_topk_smallest_f32, invalid values take the top key
+    const uint32_t bits0 = __float_as_uint(value0 + 0.0f);
+    const uint32_t bits1 = __float_as_uint(value1 + 0.0f);
+    const uint32_t flip0 = (bits0 & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    const uint32_t flip1 = (bits1 & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    uint32_t key0 = valid0 ? (bits0 ^ flip0) : 0xffffffffu;
+    uint32_t key1 = valid1 ? (bits1 ^ flip1) : 0xffffffffu;
+    const int valid_count =
+        __popc(__ballot_sync(FULL_MASK, valid0)) + __popc(__ballot_sync(FULL_MASK, valid1));
+    const int picks = min(keep_k, valid_count);
+
+    // [2] each round keeps the lowest position that holds the smallest remaining key
+    bool kept0 = false;
+    bool kept1 = false;
+    for (int round = 0; round < picks; ++round) {
+        const uint32_t smallest = __reduce_min_sync(FULL_MASK, min(key0, key1));
+        const uint32_t owners0 = __ballot_sync(FULL_MASK, key0 == smallest);
+        const uint32_t owners1 = __ballot_sync(FULL_MASK, key1 == smallest);
+        const bool first = owners0 != 0;
+        const bool win0 = first && lane_id == __ffs(owners0) - 1;
+        const bool win1 = !first && lane_id == __ffs(owners1) - 1;
+        kept0 = kept0 || win0;
+        kept1 = kept1 || win1;
+        key0 = win0 ? 0xffffffffu : key0;
+        key1 = win1 ? 0xffffffffu : key1;
+    }
+    return valid && (position < WARP_SIZE ? kept0 : kept1);
+#else
+    const float my_value = valid ? value : FLT_MAX;
+    const int valid0_int = valid0 ? 1 : 0;
+    const int valid1_int = valid1 ? 1 : 0;
+    int rank = 0;
+
+#pragma unroll
+    for (int src = 0; src < WARP_SIZE; ++src) {
+        const float other0 = __shfl_sync(FULL_MASK, value0, src);
+        const int other0_valid = __shfl_sync(FULL_MASK, valid0_int, src);
+        const int other0_pos = src;
+        if (other0_valid && (other0 < my_value || (other0 == my_value && other0_pos < position))) {
+            rank++;
+        }
+
+        const float other1 = __shfl_sync(FULL_MASK, value1, src);
+        const int other1_valid = __shfl_sync(FULL_MASK, valid1_int, src);
+        const int other1_pos = src + WARP_SIZE;
+        if (other1_valid && (other1 < my_value || (other1 == my_value && other1_pos < position))) {
             rank++;
         }
     }
@@ -403,7 +477,7 @@ __device__ inline void swap_if_needed(K &k0, V &v0, K &k1, V &v1, const bool asc
 }
 
 template <class K, class V, unsigned _N, unsigned warp_size>
-__device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range, const bool asc) { // SHAME(TALLFUNC) SHAME(WIDEFUNC)
+__device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range, const bool asc) {
     if (_N == 1) {
         const auto lane_id = tidx() % warp_size;
         if (range == 1) {
@@ -617,12 +691,12 @@ __device__ __noinline__ void candidate_by_radix_sort(
 }
 
 template <unsigned N_1, unsigned N_2>
-__device__ __noinline__ void topk_candidate_bitonic_sort_and_merge(
+__device__ __forceinline__ void topk_candidate_bitonic_sort_and_merge(
     INDEX_T *result_indices_ptr,
     DISTANCE_T *result_distances_ptr,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk,
-    bool first) { // SHAME(TALLFUNC)
+    bool first) {
     const unsigned lane_id = tidx() % 32;
     const unsigned warp_id = tidx() / 32;
 
@@ -812,7 +886,7 @@ __host__ __device__ inline uint32_t hashtable_getsize(const uint32_t bitlen) {
     return 1 << bitlen;
 }
 
-__device__ inline void hashtable_init(INDEX_T *const table, const unsigned bitlen, unsigned FIRST_TID = 0) { // SHAME(WIDEFUNC)
+__device__ inline void hashtable_init(INDEX_T *const table, const unsigned bitlen, unsigned FIRST_TID = 0) {
     if (tidx() < FIRST_TID)
         return;
     for (uint32_t i = tidx() - FIRST_TID; i < hashtable_getsize(bitlen); i += blockDim.x - FIRST_TID) {
@@ -967,7 +1041,7 @@ static __device__ inline void rotate_vector_gpu(const float *src, float *dst,
  */
 static __device__ inline void sketch_apply(const float *src, float *dst, const float *flipv,
                                            const float *spectr, const float *flipu,
-                                           int dim, int padded_dim) { // SHAME(MANYARG)
+                                           int dim, int padded_dim) {
     const int tid = tidx();
     const float scale = rsqrtf(static_cast<float>(padded_dim));
 
@@ -1029,7 +1103,7 @@ static __device__ __forceinline__ uint8_t fastscan_decode_code_for_neighbor_seq_
 }
 
 static __device__ inline void query_prepare_lut_gpu(const float *query_raw, QueryFactors &scratch,
-                                                    const float *signs_ptr, int dim, int padded_dim) { // SHAME(TALLFUNC) SHAME(WIDEFUNC)
+                                                    const float *signs_ptr, int dim, int padded_dim) {
     constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
 
     int tid = tidx();
@@ -1147,7 +1221,7 @@ static __device__ inline void query_prepare_lut_gpu(const float *query_raw, Quer
  */
 template <int CODEBITS>
 static __device__ inline void lut_build(QueryFactors &scratch, const float *levels,
-                                        int padded_dim) { // SHAME(TALLFUNC) SHAME(WIDEFUNC)
+                                        int padded_dim) {
     constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
     constexpr int GROUP = QUANT_NIBBLE_DIMS / CODEBITS;
     constexpr int LMASK = (1 << CODEBITS) - 1;
@@ -1356,7 +1430,7 @@ static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8
 template <int LANES, int CODEBITS>
 static __device__ __forceinline__ float lut_reduce(
     const QueryFactors &qf, const uint8_t *code_block, int neighbor_idx,
-    int padded_dim, int bytes_per_neighbor) { // SHAME(WIDEFUNC) SHAME(MANYARG)
+    int padded_dim, int bytes_per_neighbor) {
     const int lane_id = tidx() & (WARP_SIZE - 1);
     const int group_lane = (LANES == 1) ? 0 : (lane_id & (LANES - 1));
     const int num_codebook = (padded_dim * CODEBITS) >> 2;
@@ -1464,7 +1538,7 @@ template <int LANES, int CODEBITS>
 static __device__ inline DISTANCE_T turbop_scan(
     const QueryFactors &qa, const QueryFactors &qb, const uint8_t *code_block,
     const uint8_t *sign_block, int neighbor_idx, const float *factors, int max_degree,
-    float exact_dist, int padded_dim, int code_bytes, int sign_bytes) { // SHAME(WIDEFUNC) SHAME(MANYARG)
+    float exact_dist, int padded_dim, int code_bytes, int sign_bytes) {
     const float shared = factors[neighbor_idx];
     if (shared == FLT_MAX)
         return (LANES > 1) ? 0.0f : FLT_MAX;
