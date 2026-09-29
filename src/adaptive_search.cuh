@@ -292,7 +292,8 @@ void QuantizedPrunedBeamSearch(
     int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
     const float* __restrict__ d_queries, const float* __restrict__ d_qg_data, const float* __restrict__ d_qg_signs,
     const float* __restrict__ d_qg_sketch, const float* __restrict__ d_qg_levels,
-    vidType* __restrict__ d_results, uint32_t* __restrict__ d_iters, vidType entry_point,
+    vidType* __restrict__ d_results, float* __restrict__ d_result_dists,
+    uint32_t* __restrict__ d_iters, vidType entry_point,
     size_t row_offset, size_t neighbor_offset, size_t code_offset, size_t sign_offset,
     size_t factor_offset, int max_iter_by_beam, float phase2_rho, bool use_ip)
 {
@@ -718,11 +719,13 @@ void QuantizedPrunedBeamSearch(
             const INDEX_T result = raw_result & 0x7fffffffu;
             if (hashtable_insert(HASH_TABLE, bitlen, result)) {
                 d_results[query_id * K + output_count] = result;
+                d_result_dists[query_id * K + output_count] = TOP_K_DISTANCE[i];
                 ++output_count;
             }
         }
         for (int i = output_count; i < K; ++i) {
             d_results[query_id * K + i] = MAX_INDEX;
+            d_result_dists[query_id * K + i] = FLT_MAX;
         }
         d_iters[query_id] = static_cast<uint32_t>(iter);
     }

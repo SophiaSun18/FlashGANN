@@ -420,6 +420,7 @@ template <typename T = float>
 __device__ __forceinline__ T warp_l2_distance(int dim, const T *a, const T *b) {
     int thread_lane = tidx() & (WARP_SIZE - 1); // thread index within the warp
     T val = 0.;
+#pragma unroll 4
     for (int i = thread_lane; i < dim; i += WARP_SIZE)
         val += (a[i] - b[i]) * (a[i] - b[i]);
     T sum = val;
@@ -436,6 +437,7 @@ template <typename T = float>
 __device__ __forceinline__ T warp_ip_distance(int dim, const T *a, const T *b) {
     int thread_lane = tidx() & (WARP_SIZE - 1);
     T val = 0.;
+#pragma unroll 4
     for (int i = thread_lane; i < dim; i += WARP_SIZE)
         val += a[i] * b[i];
     T sum = val;

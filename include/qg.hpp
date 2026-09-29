@@ -12,6 +12,11 @@
 #include "metric.hpp"
 #include "quant.hpp"
 
+inline constexpr int QG_TIMER_QUERY_TRANSFER = 0;
+inline constexpr int QG_TIMER_SEARCH = 1;
+inline constexpr int QG_TIMER_RESULT_COPY = 2;
+inline constexpr int QG_SHARD_TIMER_COUNT = 3;
+
 class QuantizationGraph {
 public:
     // Codebook layout: entry point followed by per-node raw vector, packed codes, factors, and neighbor IDs.
@@ -77,8 +82,9 @@ public:
     inline size_t get_row_offset() const { return row_offset_; }
     inline vidType get_entry_point() const { return entry_point_; }
 
-    void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx, uint32_t* iters, int repeat,
-                             int beam_sz, double& elapsed);
+    void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx,
+                             float* result_dist, uint32_t* iters, int repeat, int beam_sz,
+                             double* elapsed);
 
 private:
     void init_layout() {
