@@ -125,7 +125,11 @@ static __device__ __forceinline__ int keep_count_for_expander(
 
     const int rho_keep = static_cast<int>(keep_count_per_parent(active_neighbors, state.adaptive_rho));
     const uint32_t spec_degree = static_cast<uint32_t>(state.adaptive_spec_degree);
-    const uint32_t per_parent_bound = static_cast<uint32_t>(BUFFER_BOUND) / spec_degree;
+    uint32_t candidate_bound = static_cast<uint32_t>(BUFFER_BOUND);
+    if (active_neighbors <= WARP_SIZE && candidate_bound > WARP_SIZE) {
+        candidate_bound = WARP_SIZE;
+    }
+    const uint32_t per_parent_bound = candidate_bound / spec_degree;
     const int budget_keep = clamp_int(static_cast<int>(per_parent_bound), 1, active_count);
     int max_keep = (rho_keep < budget_keep) ? rho_keep : budget_keep;
     if (kth_cutoff_valid) {
@@ -145,6 +149,9 @@ static __device__ __forceinline__ T* allocate_shared_tail_array(char*& tail_base
 static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t max_degree) {
     const uint32_t max_capacity = static_cast<uint32_t>(THETA_MAX) * max_degree;
     uint32_t capacity = static_cast<uint32_t>(BUFFER_BOUND);
+    if (max_degree <= WARP_SIZE && capacity > WARP_SIZE) {
+        capacity = WARP_SIZE;
+    }
     if (capacity > max_capacity) capacity = max_capacity;
     return capacity;
 }
