@@ -16,21 +16,72 @@
 
 #include "include/data_io.hpp"
 #include "include/metric.hpp"
+#include "include/common.hpp"
+#define GPU_SEARCH_MODE_FLASHGANN 1
+#define GPU_SEARCH_MODE_PATHW 2
+
+#ifndef GPU_SEARCH_MODE
+#error "GPU_SEARCH_MODE must be set by the GPU binary build target"
+#endif
+
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+#include "include/index.hpp"
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN
 #include "include/qg.hpp"
 #include "include/quant.hpp"
-#include "include/common.hpp"
+#else
+#error "Unknown GPU_SEARCH_MODE"
+#endif
 
-/** @brief Command-line options, one data and codebook file per shard. */
-struct CliConfig {
-    int total_shards = 1;
-    std::vector<std::string> data_files;
-    std::vector<std::string> codebook_files;
-    std::string query_file;
-    std::string gt_file;
+/** @brief Recognize explicit GPU modes, following beam_search_collab's shared-main convention. */
+static bool is_gpu_mode_arg(const std::string& value) {
+    return value == "gpu_flashgann" || value == "gpu_pathw" || value == "flashgann" || value == "pathw";
+}
+
+/** @brief Name the search mode linked into this executable. */
+static const char* gpu_search_mode_name() {
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    return "gpu_pathw";
+#else
+    return "gpu_flashgann";
+#endif
+}
+
+/** SHAME(TALLFUNC) */
+int main(int argc, char** argv) {
+    const std::string mode = gpu_search_mode_name();
+    int input_arg = 1;
+    if (argc > 1 && is_gpu_mode_arg(argv[1])) {
+        const std::string requested = std::string(argv[1]).starts_with("gpu_") ? argv[1] : "gpu_" + std::string(argv[1]);
+        if (mode != requested) {
+            fprintf(stderr, "This binary was built for mode %s, got %s\n", mode.c_str(), argv[1]);
+            return 1;
+        }
+        input_arg = 2;
+    }
+    constexpr bool pathw = GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW;
+    const int input_files = pathw ? 5 : 4;
+    if (argc < input_arg + input_files) {
+        fprintf(stderr, "Usage: %s [%s] <base.fvecs> <query.fvecs> <gt.ivecs> <graph_or_codebook> [signbit.bin for gpu_pathw] [K=100] [beam=128] [degree=32] [-quant rbq|tbq] [-bits n] [-p_ratio keep] [-a_ratio prune] [-repeat n] [-iters file] [-csv file]\n", argv[0], mode.c_str());
+        return 1;
+    }
+
+    const char* data_file = argv[input_arg];
+    const char* query_file = argv[input_arg + 1];
+    const char* gt_file = argv[input_arg + 2];
+    const char* index_file = argv[input_arg + 3];
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    const char* sign_file = argv[input_arg + 4];
+    float keep_ratio = 0.0f;
+    float prune_ratio = 0.7f;
+#else
+    int code_bits = 1;
+#endif
+
     int K = 100;
     int beam_size = 128;
     int degree = 32;
-    int code_bits = 1;
+    bool degree_explicit = false;
     std::string csv_file;
     std::string iters_file;
     int repeat = 1;
@@ -93,18 +144,13 @@ static bool is_valid_merge_candidate(vidType id, float dist) {
     return id != std::numeric_limits<vidType>::max() && std::isfinite(dist) && dist < FLT_MAX;
 }
 
-/**
- * @brief Parse the optional positional values and the flags after the file arguments.
- * @param argc argument count
- * @param argv arguments
- * @param arg_idx first argument after the files
- * @param cfg receives the options
- * @return false on an unknown flag
- */
-static bool parse_common_args(int argc, char** argv, int arg_idx, CliConfig& cfg) {
-    if (arg_idx < argc && argv[arg_idx][0] != '-') cfg.K = atoi(argv[arg_idx++]);
-    if (arg_idx < argc && argv[arg_idx][0] != '-') cfg.beam_size = atoi(argv[arg_idx++]);
-    if (arg_idx < argc && argv[arg_idx][0] != '-') cfg.degree = atoi(argv[arg_idx++]);
+    int arg_idx = input_arg + input_files;
+    if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
+    if (arg_idx < argc && argv[arg_idx][0] != '-') beam_size = atoi(argv[arg_idx++]);
+    if (arg_idx < argc && argv[arg_idx][0] != '-') {
+        degree = atoi(argv[arg_idx++]);
+        degree_explicit = true;
+    }
     while (arg_idx < argc) {
         std::string arg = argv[arg_idx];
         if (arg == "-csv" && arg_idx + 1 < argc) {
@@ -112,12 +158,25 @@ static bool parse_common_args(int argc, char** argv, int arg_idx, CliConfig& cfg
         } else if (arg == "-iters" && arg_idx + 1 < argc) {
             cfg.iters_file = argv[++arg_idx];
         } else if (arg == "-repeat" && arg_idx + 1 < argc) {
-            cfg.repeat = atoi(argv[++arg_idx]);
-            if (cfg.repeat < 1) cfg.repeat = 1;
+            repeat = atoi(argv[++arg_idx]);
+            if (repeat < 1) repeat = 1;
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+        } else if ((arg == "-p_ratio" || arg == "-a_ratio") && arg_idx + 1 < argc) {
+            char* end = nullptr;
+            const char* value = argv[++arg_idx];
+            const float ratio = std::strtof(value, &end);
+            if (end == value || *end) {
+                fprintf(stderr, "Invalid PathW ratio: %s\n", value);
+                return 1;
+            }
+            if (arg == "-p_ratio") keep_ratio = ratio;
+            else prune_ratio = ratio;
+#else
         } else if (arg == "-quant" && arg_idx + 1 < argc) {
             g_quant_type = quant_parse(argv[++arg_idx]);
         } else if (arg == "-bits" && arg_idx + 1 < argc) {
-            cfg.code_bits = atoi(argv[++arg_idx]);
+            code_bits = atoi(argv[++arg_idx]);
+#endif
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return false;
@@ -176,174 +235,90 @@ int main(int argc, char** argv) {
     }
 
     printf("========================================\n");
-    printf("FlashGANN AP Loading from:\n");
+    printf("GPU Beam Search Loading from:\nMode: %s\n", mode.c_str());
     printf("========================================\n");
-    printf("Shards: %d\n", cfg.total_shards);
-    for (int shard = 0; shard < cfg.total_shards; ++shard) {
-        printf("Shard %d data file: %s\n", shard, cfg.data_files[shard].c_str());
-        printf("Shard %d QG codebook: %s\n", shard, cfg.codebook_files[shard].c_str());
-    }
-    printf("Query file: %s\n", cfg.query_file.c_str());
-    printf("Ground truth: %s\n", cfg.gt_file.c_str());
-    printf("K: %d\n", cfg.K);
-    printf("Beam size: %d\n", cfg.beam_size);
-    printf("Degree: %d\n", cfg.degree);
-    printf("Quantizer: %s, bits: %d\n", quant_name(g_quant_type), cfg.code_bits);
-    if (!cfg.csv_file.empty()) printf("CSV output: %s\n", cfg.csv_file.c_str());
+    printf("Data file: %s\n", data_file);
+    printf("Query file: %s\n", query_file);
+    printf("Ground truth: %s\n", gt_file);
+    printf("%s: %s\n", pathw ? "Graph" : "QG codebook", index_file);
+    printf("K: %d\n", K);
+    printf("Beam size: %d\n", beam_size);
+    if (!pathw || degree_explicit) printf("Degree: %d\n", degree);
+    else printf("Degree: from graph header\n");
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    printf("PathW signbit: %s\n", sign_file);
+#else
+    printf("Quantizer: %s, bits: %d\n", quant_name(g_quant_type), code_bits);
+#endif
+    if (!csv_file.empty()) printf("CSV output: %s\n", csv_file.c_str());
 
-    g_metric_type = infer_metric_from_dataset_path(cfg.data_files[0]);
+    g_metric_type = infer_metric_from_dataset_path(data_file);
     printf("Metric: %s\n", metric_name(g_metric_type));
     printf("========================================\n\n");
 
-    LoadedVectors<float> query_vectors = load_fvecs<float>(cfg.query_file, "queries");
-    LoadedVectors<int> groundtruth_vectors = load_ivecs(cfg.gt_file, "ground truth");
-
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    IndexGraph<float> index;
+    try {
+        index.load_graph_index(index_file);
+        index.load_data(data_file);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "PathW input error: %s\n", error.what());
+        return 1;
+    }
+    index.metric = g_metric_type;
+    if (degree_explicit && index.maxDeg != degree) {
+        fprintf(stderr, "Requested degree %d does not match graph degree %d\n", degree, index.maxDeg);
+        return 1;
+    }
+    degree = index.maxDeg;
+    size_t nq = 0, gt_nq = 0;
+    int query_dim = 0, gt_k = 0;
+    const std::vector<float> queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
+    const std::vector<int> groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
+    const int base_dim = index.d;
+#else
+    LoadedVectors<float> base = load_fvecs<float>(data_file, "data");
+    LoadedVectors<float> query_vectors = load_fvecs<float>(query_file, "queries");
+    LoadedVectors<int> groundtruth_vectors = load_ivecs(gt_file, "ground truth");
     const size_t nq = query_vectors.count;
     const int query_dim = query_vectors.dim;
     const size_t gt_nq = groundtruth_vectors.count;
     const int gt_k = groundtruth_vectors.dim;
+    const int base_dim = base.dim;
+    const std::vector<float>& queries = query_vectors.values;
+    const std::vector<int>& groundtruth = groundtruth_vectors.values;
+#endif
+    if (query_dim != base_dim) {
+        fprintf(stderr, "Query dimension %d does not match data dimension %d\n", query_dim, base_dim);
+        return 1;
+    }
     if (gt_nq != nq) {
         fprintf(stderr, "Ground-truth query count %zu does not match query count %zu\n", gt_nq, nq);
         return 1;
     }
 
-    // load every shard's base vectors; shard ids are offset by the shards before it
-    std::vector<LoadedVectors<float>> bases;
-    std::vector<size_t> shard_offsets;
-    bases.reserve(cfg.total_shards);
-    shard_offsets.reserve(cfg.total_shards);
-    size_t total_base_count = 0;
-    for (int shard = 0; shard < cfg.total_shards; ++shard) {
-        shard_offsets.push_back(total_base_count);
-        bases.push_back(load_fvecs<float>(cfg.data_files[shard], "data"));
-        if (query_dim != bases.back().dim) {
-            fprintf(stderr, "Query dimension %d does not match shard %d data dimension %d\n",
-                    query_dim, shard, bases.back().dim);
-            return 1;
-        }
-        total_base_count += bases.back().count;
+    if (K < 1 || beam_size < 1 || degree < 1) {
+        fprintf(stderr, "K, beam size and degree must be positive\n");
+        return 1;
     }
-    if (total_base_count > static_cast<size_t>(std::numeric_limits<vidType>::max())) {
-        fprintf(stderr, "Total sharded data count %zu exceeds vidType capacity\n",
-                total_base_count);
+    std::vector<vidType> results(nq * K);
+    std::vector<uint32_t> iters(nq);
+    double elapsed = 0.0;
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    try {
+        index.search_pathw(static_cast<int>(nq), queries.data(), K, results.data(), beam_size,
+                           sign_file, keep_ratio, prune_ratio, elapsed, iters.data(), repeat);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "PathW error: %s\n", error.what());
         return 1;
     }
 
-    const std::vector<float>& queries = query_vectors.values;
-    const std::vector<int>& groundtruth = groundtruth_vectors.values;
-
-    // record each shard's intermediate results, iterations and elapsed time
-    const size_t shards = static_cast<size_t>(cfg.total_shards);
-    std::vector<vidType> results(shards * nq * cfg.K);
-    std::vector<float> result_dist(shards * nq * cfg.K);
-    std::vector<uint32_t> shard_iters(shards * nq);
-    std::vector<vidType> merged_results(nq * cfg.K, std::numeric_limits<vidType>::max());
-    std::vector<float> merged_dist(nq * cfg.K, FLT_MAX);
-    std::vector<uint32_t> merged_iters(nq, 0);
-    std::vector<double> elapsed(shards * QG_SHARD_TIMER_COUNT + 1, 0.0);
-
-    int device_count = 0;
-    cudaError_t dev_err = cudaGetDeviceCount(&device_count);
-    if (dev_err != cudaSuccess || device_count <= 0) {
-        fprintf(stderr, "No CUDA devices available: %s\n", cudaGetErrorString(dev_err));
-        return 1;
-    }
-    printf("Found %d CUDA devices\n", device_count);
-
-    int shard_failed = 0;
-
-#pragma omp parallel for schedule(static)
-    for (int shard = 0; shard < cfg.total_shards; ++shard) {
-        const int device_id = shard % device_count;
-        const size_t result_base = static_cast<size_t>(shard) * nq * cfg.K;
-        const size_t elapsed_base = static_cast<size_t>(shard) * QG_SHARD_TIMER_COUNT;
-        try {
-            cudaError_t set_err = cudaSetDevice(device_id);
-            if (set_err != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(set_err));
-            }
-            printf("Shard %d running on GPU %d\n", shard, device_id);
-            QuantizationGraph qg(bases[shard].count, bases[shard].dim, cfg.degree,
-                                 cfg.codebook_files[shard], g_quant_type, cfg.code_bits);
-            qg.set_metric(g_metric_type);
-            qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), cfg.K,
-                                   results.data() + result_base, result_dist.data() + result_base,
-                                   shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat,
-                                   cfg.beam_size, elapsed.data() + elapsed_base);
-        } catch (const std::exception& e) {
-#pragma omp critical
-            {
-                fprintf(stderr, "Shard %d failed: %s\n", shard, e.what());
-            }
-#pragma omp atomic write
-            shard_failed = 1;
-        }
-    }
-    if (shard_failed) return 1;
-
-    // merge the per-shard sorted lists by distance, lower shard first on ties
-    const size_t merge_timer_idx = shards * QG_SHARD_TIMER_COUNT;
-    auto merge_start = std::chrono::high_resolution_clock::now();
-    std::vector<int> merge_positions(nq * shards, 0);
-#pragma omp parallel for schedule(static)
-    for (size_t query_id = 0; query_id < nq; ++query_id) {
-        int* positions = merge_positions.data() + query_id * shards;
-        for (int out_rank = 0; out_rank < cfg.K; ++out_rank) {
-            int best_shard = -1;
-            vidType best_local_id = std::numeric_limits<vidType>::max();
-            float best_dist = FLT_MAX;
-
-            for (int shard = 0; shard < cfg.total_shards; ++shard) {
-                while (positions[shard] < cfg.K) {
-                    const size_t in_idx = (static_cast<size_t>(shard) * nq + query_id) * cfg.K
-                                          + positions[shard];
-                    const vidType candidate_id = results[in_idx];
-                    const float candidate_dist = result_dist[in_idx];
-                    if (is_valid_merge_candidate(candidate_id, candidate_dist)) {
-                        if (best_shard < 0 || candidate_dist < best_dist ||
-                            (candidate_dist == best_dist && shard < best_shard)) {
-                            best_shard = shard;
-                            best_local_id = candidate_id;
-                            best_dist = candidate_dist;
-                        }
-                        break;
-                    }
-                    ++positions[shard];
-                }
-            }
-
-            const size_t out_idx = query_id * cfg.K + out_rank;
-            if (best_shard < 0) {
-                merged_results[out_idx] = std::numeric_limits<vidType>::max();
-                merged_dist[out_idx] = FLT_MAX;
-                continue;
-            }
-
-            merged_results[out_idx] =
-                static_cast<vidType>(shard_offsets[best_shard] + best_local_id);
-            merged_dist[out_idx] = best_dist;
-            ++positions[best_shard];
-        }
-
-        // a query takes as many iterations as its slowest shard
-        for (int shard = 0; shard < cfg.total_shards; ++shard) {
-            const uint32_t count = shard_iters[static_cast<size_t>(shard) * nq + query_id];
-            merged_iters[query_id] = std::max(merged_iters[query_id], count);
-        }
-    }
-    auto merge_end = std::chrono::high_resolution_clock::now();
-    elapsed[merge_timer_idx] = std::chrono::duration<double>(merge_end - merge_start).count();
-
-    double max_search_elapsed = 0.0;
-    for (int shard = 0; shard < cfg.total_shards; ++shard) {
-        const size_t base_idx = static_cast<size_t>(shard) * QG_SHARD_TIMER_COUNT;
-        max_search_elapsed = std::max(max_search_elapsed, elapsed[base_idx + QG_TIMER_SEARCH]);
-    }
-
-    const float recall = compute_recall_dedup(merged_results.data(), groundtruth.data(), nq, cfg.K, gt_k) * 100.0f;
-    const double nqd = static_cast<double>(nq);
-    const double latency_ms = (nq > 0) ? (max_search_elapsed * 1000.0 / nqd) : 0.0;
-    const double qps = (max_search_elapsed > 0.0) ? (nqd / max_search_elapsed) : 0.0;
+#else
+    QuantizationGraph qg(base.count, base.dim, degree, index_file, g_quant_type, code_bits);
+    qg.set_metric(g_metric_type);
+    qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), K, results.data(), iters.data(),
+                           repeat, beam_size, elapsed);
+#endif
 
     printf("\n========================================\n");
     printf("Timing Breakdown\n");
