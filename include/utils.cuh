@@ -93,7 +93,6 @@ typedef float DISTANCE_T;
 
 struct QueryFactors {
     float *rotated_query = nullptr;
-    uint8_t *quantized_query = nullptr;
     uint8_t *lut = nullptr;
     float low_val = 0.0f;
     float high_val = 0.0f;
