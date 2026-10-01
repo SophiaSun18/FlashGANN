@@ -155,9 +155,6 @@ void QuantizedPrunedBeamSearch(
             break;
         }
 
-        // periodically reset the hash table
-        const bool reset_hash = ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0);
-
         // sort and merge existing candidates into the beam
         dispatch_beam_management(
             ALL_INDEX, ALL_DISTANCE, CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, (iter == 0));
@@ -172,62 +169,47 @@ void QuantizedPrunedBeamSearch(
             CANDIDATE_INDEX[i] = MAX_INDEX;
             CANDIDATE_DISTANCE[i] = FLT_MAX;
         }
-        for (int i = tidx(); i < SEARCH_WIDTH; i += blockDim.x) {
-            PARENT_NODE_LIST[i] = MAX_INDEX;
-            PARENT_DISTANCE_LIST[i] = FLT_MAX;
-        }
-        if (reset_hash) {
-            hashtable_init(HASH_TABLE, bitlen);
-            __syncthreads();
-            hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
-            __syncthreads();
-        }
 
-        // update adaptive parameters before expander selection
-        if (tidx() == 0) {
-            compact_candidate_count = 0;
-            current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
-            INDEX_T current_top1 = MAX_INDEX;
-            const int head_stall_iters = update_head_stall_counter(TOP_K_INDEX, adaptive_state, &current_top1);
-            const bool phase_changed = adaptive_state.warmup_done || head_stall_iters >= static_cast<int>(TOP1_WARMUP_STALL_ITERS);
-            DISTANCE_T last_expander_distance = FLT_MAX;
-            DISTANCE_T current_expander_distance = FLT_MAX;
-            const float distance_reduction_rate = update_expander_progress(adaptive_state, &last_expander_distance, &current_expander_distance);
+        // warp 0 updates the adaptive parameters and selects expanders, while the other warps periodically reset
+        // the hash table; the barrier before expansion publishes both
+        if (warpidx() == 0) {
+            if (laneidx() == 0) {
+                compact_candidate_count = 0;
+                current_kth_cutoff = get_current_kth_cutoff(K, beam_sz, TOP_K_INDEX, TOP_K_DISTANCE);
+                INDEX_T current_top1 = MAX_INDEX;
+                const int head_stall_iters = update_head_stall_counter(TOP_K_INDEX, adaptive_state, &current_top1);
+                const bool phase_changed = adaptive_state.warmup_done || head_stall_iters >= static_cast<int>(TOP1_WARMUP_STALL_ITERS);
+                DISTANCE_T last_expander_distance = FLT_MAX;
+                DISTANCE_T current_expander_distance = FLT_MAX;
+                const float distance_reduction_rate = update_expander_progress(adaptive_state, &last_expander_distance, &current_expander_distance);
 
-            if (phase_changed) {
-                adaptive_state = apply_stage2_state(current_top1, head_stall_iters, last_expander_distance,
-                    current_expander_distance, adaptive_state, phase2_rho);
-            } else {
-                const bool adaptive_should_check = (iter == 0) || ((iter % static_cast<int>(CHECK_INTERVAL)) == 0);
-                if (adaptive_should_check) {
-                    adaptive_state = update_adaptive_state(current_top1, head_stall_iters, last_expander_distance,
-                        current_expander_distance, distance_reduction_rate, adaptive_state, phase2_rho);
+                if (phase_changed) {
+                    adaptive_state = apply_stage2_state(current_top1, head_stall_iters, last_expander_distance,
+                        current_expander_distance, adaptive_state, phase2_rho);
                 } else {
-                    adaptive_state.top1_node = current_top1;
-                    adaptive_state.top1_stall_iters = head_stall_iters;
-                    adaptive_state.last_expander_distance = last_expander_distance;
-                    adaptive_state.current_expander_distance = current_expander_distance;
+                    const bool adaptive_should_check = (iter == 0) || ((iter % static_cast<int>(CHECK_INTERVAL)) == 0);
+                    if (adaptive_should_check) {
+                        adaptive_state = update_adaptive_state(current_top1, head_stall_iters, last_expander_distance,
+                            current_expander_distance, distance_reduction_rate, adaptive_state, phase2_rho);
+                    } else {
+                        adaptive_state.top1_node = current_top1;
+                        adaptive_state.top1_stall_iters = head_stall_iters;
+                        adaptive_state.last_expander_distance = last_expander_distance;
+                        adaptive_state.current_expander_distance = current_expander_distance;
+                    }
                 }
             }
-        }
-        __syncwarp();
-
-        // select expanders from the current beam based on the adaptive speculation degree
-        if (warpidx() == 0) {
-            keep_expanding = pick_expanders(adaptive_state.adaptive_spec_degree, PARENT_LIST, beam_sz, TOP_K_INDEX);
             __syncwarp();
-            // record how many expanders are selected for this iteration
-            const int filled = min(static_cast<int>(keep_expanding), static_cast<int>(SEARCH_WIDTH));
-            for (int p = laneidx(); p < filled; p += WARP_SIZE) {
-                const uint32_t parent_pos = PARENT_LIST[p];
-                const INDEX_T parent_node = TOP_K_INDEX[parent_pos] & 0x7fffffffu;
-                PARENT_NODE_LIST[p] = parent_node;
-                PARENT_DISTANCE_LIST[p] = TOP_K_DISTANCE[parent_pos];
-            }
+            keep_expanding = pickparents(adaptive_state.adaptive_spec_degree, beam_sz, TOP_K_INDEX,
+                                          TOP_K_DISTANCE, PARENT_NODE_LIST, PARENT_DISTANCE_LIST);
             __syncwarp();
             if (laneidx() == 0 && keep_expanding) {
                 record_selected_expander_dist(keep_expanding, PARENT_DISTANCE_LIST, &adaptive_state);
             }
+        } else if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
+            hashtable_init(HASH_TABLE, bitlen, WARP_SIZE);
+            namedsync(1, BLOCK_SIZE - WARP_SIZE);
+            hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz, WARP_SIZE);
         }
         __syncthreads();
 
@@ -238,141 +220,13 @@ void QuantizedPrunedBeamSearch(
         // use shared-memory pruning for one expander, or warp-local pruning for multiple expanders
         const bool use_local_gate = adaptive_state.adaptive_spec_degree > 1;
         if (!use_local_gate) {
-            const uint32_t candidate_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
-            const INDEX_T parent_node = PARENT_NODE_LIST[0];
-            const bool parent_valid = parent_node != MAX_INDEX;
-            const float* parent_row = parent_valid ? d_qg_data + static_cast<size_t>(parent_node) * row_offset : nullptr;
-            const vidType* parent_neighbors = parent_valid ? reinterpret_cast<const vidType*>(parent_row + neighbor_offset) : nullptr;
-
-            // gather valid neighbors into shared memory
-            for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
-                INDEX_T child_id = MAX_INDEX;
-                if (i < static_cast<int>(candidate_work_count) && parent_valid) {
-                    child_id = parent_neighbors[i];
-                    if (child_id >= npoints || hashtable_contains(HASH_TABLE, bitlen, child_id)) {
-                        child_id = MAX_INDEX;
-                    }
-                }
-                CANDIDATE_INDEX[i] = child_id;
-                CANDIDATE_DISTANCE[i] = (child_id == MAX_INDEX) ? FLT_MAX : 0.0f;
-            }
-            __syncthreads();
-
-            // skip estimation when all valid neighbors fit within the keep budget
-            const int keep_count = keep_count_for_expander(candidate_work_count, adaptive_state);
-            const uint32_t valid_candidate_count = count_valid_candidates_warp_reduced(
-                CANDIDATE_INDEX, CANDIDATE_DISTANCE, static_cast<int>(candidate_work_count), MAX_INDEX, warp_stat_counts);
-            const bool keep_all_valid = keep_count >= static_cast<int>(valid_candidate_count);
-            int effective_keep_count = keep_count;
-
-            // estimate and prune only when valid candidates exceed the keep budget
-            if (!keep_all_valid) {
-                const float* parent_factors = parent_row + factor_offset;
-                const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(parent_row + code_offset);
-                const uint8_t* parent_sign_base = reinterpret_cast<const uint8_t*>(parent_row + sign_offset);
-                const int bytes_per_neighbor = static_cast<int>(quant_bytes(padded_dim, CODEBITS));
-                const int sign_bytes = static_cast<int>(quant_bytes(padded_dim, 1));
-                constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
-                constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
-                const int group_lane = laneidx() & (lanes_per_neighbor - 1);
-                const int warp_group = laneidx() / lanes_per_neighbor;
-
-                for (int base = warpidx() * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
-                    const int i = base + warp_group;
-                    bool valid_candidate = i < static_cast<int>(candidate_work_count) && CANDIDATE_INDEX[i] != MAX_INDEX;
-                    DISTANCE_T est_dist = FLT_MAX;
-                    if (valid_candidate) {
-                        if constexpr (turbop) {
-                            est_dist = turbop_scan<lanes_per_neighbor, CODEBITS>(
-                                qf, qb, parent_code_base, parent_sign_base, i, parent_factors,
-                                max_degree, PARENT_DISTANCE_LIST[0], padded_dim,
-                                bytes_per_neighbor, sign_bytes);
-                        } else {
-                            const float* triple_x = parent_factors + i;
-                            const float* factor_dq = parent_factors + max_degree + i;
-                            const float* factor_vq = parent_factors + 2 * max_degree + i;
-                            est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor, CODEBITS>(
-                                qf, parent_code_base, i, triple_x, factor_dq, factor_vq,
-                                PARENT_DISTANCE_LIST[0], padded_dim, bytes_per_neighbor);
-                        }
-                        valid_candidate = isfinite(est_dist);
-                        if (group_lane == 0) {
-                            CANDIDATE_DISTANCE[i] = valid_candidate ? est_dist : FLT_MAX;
-                            if (!valid_candidate) {
-                                CANDIDATE_INDEX[i] = MAX_INDEX;
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-
-                // tighten the keep count using the current kth-result cutoff when available
-                const DISTANCE_T kth_cutoff = current_kth_cutoff;
-                const bool kth_cutoff_valid = isfinite(static_cast<float>(kth_cutoff)) && kth_cutoff < FLT_MAX;
-                if (tidx() == 0) {
-                    shared_kth_near_count = 0;
-                }
-                __syncthreads();
-
-                if (kth_cutoff_valid) {
-                    uint32_t thread_near_count = 0;
-                    for (int i = tidx(); i < static_cast<int>(candidate_work_count); i += blockDim.x) {
-                        const DISTANCE_T dist = CANDIDATE_DISTANCE[i];
-                        if (CANDIDATE_INDEX[i] != MAX_INDEX && isfinite(dist) && dist <= kth_cutoff) {
-                            thread_near_count++;
-                        }
-                    }
-                    const uint32_t block_near_count = block_reduce_sum_u32(thread_near_count, warp_stat_counts);
-                    if (tidx() == 0) shared_kth_near_count = block_near_count;
-                }
-                __syncthreads();
-
-                effective_keep_count = keep_count_for_expander(candidate_work_count, adaptive_state, kth_cutoff_valid, shared_kth_near_count);
-
-                // sort estimated candidates and invalidate entries past the keep budget
-                dispatch_candidate_sort(
-                    CANDIDATE_INDEX, CANDIDATE_DISTANCE, candidate_buffer_size,
-                    CANDIDATE_RADIX_SCRATCH);
-                __syncthreads();
-
-                for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
-                    if (i >= effective_keep_count) {
-                        CANDIDATE_INDEX[i] = MAX_INDEX;
-                        CANDIDATE_DISTANCE[i] = FLT_MAX;
-                    }
-                }
-                __syncthreads();
-            }
-
-            // insert kept children and compute their exact distances for the next merge
-            const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : effective_keep_count;
-            for (int i = warpidx(); i < admit_scan_count; i += WARPS_PER_BLOCK) {
-                INDEX_T child_id = MAX_INDEX;
-                uint32_t inserted = 0;
-                if (laneidx() == 0) {
-                    child_id = CANDIDATE_INDEX[i];
-                    if (child_id != MAX_INDEX && CANDIDATE_DISTANCE[i] < FLT_MAX) {
-                        inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
-                    }
-                    if (!inserted) {
-                        child_id = MAX_INDEX;
-                        CANDIDATE_INDEX[i] = MAX_INDEX;
-                        CANDIDATE_DISTANCE[i] = FLT_MAX;
-                    }
-                }
-                // reconverge after lane 0's insert so the broadcasts compile to native shuffles
-                __syncwarp();
-                child_id = SHFL(child_id, 0);
-                inserted = SHFL(inserted, 0);
-
-                DISTANCE_T child_dist = FLT_MAX;
-                if (inserted) {
-                    child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
-                }
-                if (laneidx() == 0 && inserted) {
-                    CANDIDATE_DISTANCE[i] = child_dist;
-                }
-            }
+            collect_phase1_candidates_block_scan<CODEBITS, turbop>(
+                padded_dim, dim, max_degree, npoints, &qf, &qb, d_qg_data, QUERY_BUFFER,
+                row_offset, neighbor_offset, code_offset, sign_offset, factor_offset,
+                HASH_TABLE, bitlen, PARENT_NODE_LIST, PARENT_DISTANCE_LIST,
+                candidate_buffer_size, &adaptive_state, current_kth_cutoff,
+                CANDIDATE_INDEX, CANDIDATE_DISTANCE, CANDIDATE_RADIX_SCRATCH, &shared_kth_near_count,
+                warp_stat_counts, use_ip);
         } else {
             const uint32_t parent_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
 
@@ -401,11 +255,9 @@ void QuantizedPrunedBeamSearch(
             __syncthreads();
 
             // compute exact distances for compacted speculative candidates
-            const uint32_t compact_count = compact_candidate_count;
-            for (int i = warpidx(); i < static_cast<int>(compact_count); i += WARPS_PER_BLOCK) {
+            for (int i = warpidx(); i < static_cast<int>(compact_candidate_count); i += WARPS_PER_BLOCK) {
                 const INDEX_T child_id = CANDIDATE_INDEX[i];
-                DISTANCE_T child_dist = FLT_MAX;
-                child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
+                DISTANCE_T child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
                 if (laneidx() == 0) {
                     CANDIDATE_DISTANCE[i] = child_dist;
                 }

@@ -7,7 +7,7 @@
 
 struct GPUAdaptiveSearchState {
     int adaptive_spec_degree;               // Current speculation degree.
-    float adaptive_rho;             // Current rho value.
+    float adaptive_rho;                     // Current rho value.
     int policy_iters;                       // Number of policy updates.
     INDEX_T top1_node;                      // Last top-1 node.
     int top1_stall_iters;                   // Top-1 stall checks.
@@ -189,6 +189,172 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     return static_cast<uint32_t>(size);
 }
 
+
+/**
+ * @brief Single-expander expansion, the whole block working on one parent's neighbors.
+ *
+ * Gathers the unvisited neighbors into the candidate buffer, estimates and prunes them only when
+ * they exceed the keep budget, then inserts the kept children and computes their exact distances.
+ *
+ * @tparam CODEBITS quantizer code width
+ * @tparam turbop whether the index carries a TurboQuant sketch
+ */
+template <int CODEBITS, bool turbop>
+static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
+    size_t padded_dim, int dim, int max_degree, size_t npoints,
+    const QueryFactors* __restrict__ qf, const QueryFactors* __restrict__ qb,
+    const float* __restrict__ d_qg_data, const DATA_T* __restrict__ query,
+    size_t row_offset, size_t neighbor_offset, size_t code_offset, size_t sign_offset,
+    size_t factor_offset,
+    INDEX_T* __restrict__ hash_table, int bitlen,
+    const INDEX_T* __restrict__ parent_node_list,
+    const DISTANCE_T* __restrict__ parent_distance_list,
+    uint32_t candidate_buffer_size,
+    const GPUAdaptiveSearchState* __restrict__ adaptive_state,
+    DISTANCE_T current_kth_cutoff,
+    INDEX_T* __restrict__ candidate_index,
+    DISTANCE_T* __restrict__ candidate_distance,
+    void* candidate_radix_scratch,
+    uint32_t* __restrict__ kth_near_count,
+    uint32_t* __restrict__ warp_stat_counts,
+    bool use_ip)
+{
+    const uint32_t candidate_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
+    const INDEX_T parent_node = parent_node_list[0];
+    const bool parent_valid = parent_node != MAX_INDEX;
+    const float* parent_row = parent_valid ? d_qg_data + static_cast<size_t>(parent_node) * row_offset : nullptr;
+    const vidType* parent_neighbors = parent_valid ? reinterpret_cast<const vidType*>(parent_row + neighbor_offset) : nullptr;
+
+    // gather valid neighbors into shared memory
+    for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
+        INDEX_T child_id = MAX_INDEX;
+        if (i < static_cast<int>(candidate_work_count) && parent_valid) {
+            child_id = parent_neighbors[i];
+            if (child_id >= npoints || hashtable_contains(hash_table, bitlen, child_id)) {
+                child_id = MAX_INDEX;
+            }
+        }
+        candidate_index[i] = child_id;
+        candidate_distance[i] = (child_id == MAX_INDEX) ? FLT_MAX : 0.0f;
+    }
+    __syncthreads();
+
+    // skip estimation when all valid neighbors fit within the keep budget
+    const int keep_count = keep_count_for_expander(candidate_work_count, *adaptive_state);
+    const uint32_t valid_candidate_count = count_valid_candidates_warp_reduced(
+        candidate_index, candidate_distance, static_cast<int>(candidate_work_count), MAX_INDEX, warp_stat_counts);
+    const bool keep_all_valid = keep_count >= static_cast<int>(valid_candidate_count);
+    int effective_keep_count = keep_count;
+
+    // estimate and prune only when valid candidates exceed the keep budget
+    if (!keep_all_valid) {
+        const float* parent_factors = parent_row + factor_offset;
+        const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(parent_row + code_offset);
+        const uint8_t* parent_sign_base = reinterpret_cast<const uint8_t*>(parent_row + sign_offset);
+        const int bytes_per_neighbor = static_cast<int>(quant_bytes(padded_dim, CODEBITS));
+        const int sign_bytes = static_cast<int>(quant_bytes(padded_dim, 1));
+        constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
+        constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
+        const int group_lane = laneidx() & (lanes_per_neighbor - 1);
+        const int warp_group = laneidx() / lanes_per_neighbor;
+
+        for (int base = warpidx() * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
+            const int i = base + warp_group;
+            bool valid_candidate = i < static_cast<int>(candidate_work_count) && candidate_index[i] != MAX_INDEX;
+            DISTANCE_T est_dist = FLT_MAX;
+            if (valid_candidate) {
+                if constexpr (turbop) {
+                    est_dist = turbop_scan<lanes_per_neighbor, CODEBITS>(
+                        *qf, *qb, parent_code_base, parent_sign_base, i, parent_factors,
+                        max_degree, parent_distance_list[0], padded_dim,
+                        bytes_per_neighbor, sign_bytes);
+                } else {
+                    const float* triple_x = parent_factors + i;
+                    const float* factor_dq = parent_factors + max_degree + i;
+                    const float* factor_vq = parent_factors + 2 * max_degree + i;
+                    est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor, CODEBITS>(
+                        *qf, parent_code_base, i, triple_x, factor_dq, factor_vq,
+                        parent_distance_list[0], padded_dim, bytes_per_neighbor);
+                }
+                valid_candidate = isfinite(est_dist);
+                if (group_lane == 0) {
+                    candidate_distance[i] = valid_candidate ? est_dist : FLT_MAX;
+                    if (!valid_candidate) {
+                        candidate_index[i] = MAX_INDEX;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // tighten the keep count using the current kth-result cutoff when available
+        const DISTANCE_T kth_cutoff = current_kth_cutoff;
+        const bool kth_cutoff_valid = isfinite(static_cast<float>(kth_cutoff)) && kth_cutoff < FLT_MAX;
+        if (tidx() == 0) {
+            *kth_near_count = 0;
+        }
+        __syncthreads();
+
+        if (kth_cutoff_valid) {
+            uint32_t thread_near_count = 0;
+            for (int i = tidx(); i < static_cast<int>(candidate_work_count); i += blockDim.x) {
+                const DISTANCE_T dist = candidate_distance[i];
+                if (candidate_index[i] != MAX_INDEX && isfinite(dist) && dist <= kth_cutoff) {
+                    thread_near_count++;
+                }
+            }
+            const uint32_t block_near_count = block_reduce_sum_u32(thread_near_count, warp_stat_counts);
+            if (tidx() == 0) *kth_near_count = block_near_count;
+        }
+        __syncthreads();
+
+        effective_keep_count = keep_count_for_expander(candidate_work_count, *adaptive_state, kth_cutoff_valid, *kth_near_count);
+
+        // sort estimated candidates and invalidate entries past the keep budget
+        dispatch_candidate_sort(
+            candidate_index, candidate_distance, candidate_buffer_size,
+            candidate_radix_scratch);
+        __syncthreads();
+
+        for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
+            if (i >= effective_keep_count) {
+                candidate_index[i] = MAX_INDEX;
+                candidate_distance[i] = FLT_MAX;
+            }
+        }
+        __syncthreads();
+    }
+
+    // insert kept children and compute their exact distances for the next merge
+    const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : effective_keep_count;
+    for (int i = warpidx(); i < admit_scan_count; i += WARPS_PER_BLOCK) {
+        INDEX_T child_id = MAX_INDEX;
+        uint32_t inserted = 0;
+        if (laneidx() == 0) {
+            child_id = candidate_index[i];
+            if (child_id != MAX_INDEX && candidate_distance[i] < FLT_MAX) {
+                inserted = hashtable_insert(hash_table, bitlen, child_id);
+            }
+            if (!inserted) {
+                child_id = MAX_INDEX;
+                candidate_index[i] = MAX_INDEX;
+                candidate_distance[i] = FLT_MAX;
+            }
+        }
+        // reconverge after lane 0's insert so the broadcasts compile to native shuffles
+        __syncwarp();
+        child_id = SHFL(child_id, 0);
+        inserted = SHFL(inserted, 0);
+
+        DISTANCE_T child_dist = FLT_MAX;
+        if (inserted) {
+            child_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
+        }
+        if (laneidx() == 0 && inserted) {
+            candidate_distance[i] = child_dist;
+        }
+    }
+}
 
 /**
  * @brief Speculative phase-2 expansion for parents of at most 32 neighbors.

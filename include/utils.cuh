@@ -56,6 +56,15 @@ static __device__ __forceinline__ int laneidx() {
     return static_cast<int>(tidx() % WARP_SIZE);
 }
 
+/**
+ * @brief Barrier over a subset of the block's warps, on a named hardware barrier instead of barrier 0.
+ * @param id named barrier id in 1 .. 15, since 0 is the one __syncthreads uses
+ * @param threads participating threads, a multiple of the warp size
+ */
+static __device__ __forceinline__ void namedsync(int id, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(threads) : "memory");
+}
+
 // Floor for the visited-hash capacity. The workload-derived size in
 // hash_bitlen_for_search_workload() is what normally decides; this only sets the minimum.
 #ifndef GPU_HASH_BASE_BITLEN
@@ -989,6 +998,35 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T *output_list, int M, IN
         }
     }
     return num_exp;
+}
+
+static __device__ __forceinline__ uint32_t pickparents(
+    int limit, int beamsize, INDEX_T *beam, const DISTANCE_T *beamdist, INDEX_T *nodes, DISTANCE_T *dists) {
+    constexpr INDEX_T EXPANDED = 0x80000000;
+    const uint32_t lane = tidx() & (WARP_SIZE - 1);
+    const uint32_t below = (1u << lane) - 1u;
+    uint32_t picked = 0;
+    for (int base = 0; base < beamsize; base += WARP_SIZE) {
+        // [1] each lane checks one beam position of this 32-wide chunk
+        const int j = base + static_cast<int>(lane);
+        INDEX_T node = MAX_INDEX;
+        if (j < beamsize) node = beam[j];
+        const bool fresh = j < beamsize && (node & EXPANDED) == 0;
+        const uint32_t mask = __ballot_sync(FULL_MASK, fresh);
+
+        // [2] fresh lanes take consecutive parent slots in rank order
+        if (fresh) {
+            const uint32_t slot = picked + __popc(mask & below);
+            if (slot < static_cast<uint32_t>(limit)) {
+                beam[j] = node | EXPANDED;
+                nodes[slot] = node;
+                dists[slot] = beamdist[j];
+            }
+        }
+        picked += __popc(mask);
+        if (picked >= static_cast<uint32_t>(limit)) return static_cast<uint32_t>(limit);
+    }
+    return picked;
 }
 
 /*-------------------------------------------- rabitq --------------------------------------------*/
