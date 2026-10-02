@@ -3,6 +3,10 @@
 #include <cuda_runtime.h>
 
 #include "include/utils.cuh"
+#include "include/hash_table.cuh"
+#include "include/distance.cuh"
+#include "include/beam_management.cuh"
+#include "include/quant.cuh"
 
 // every iteration expands SEARCH_WIDTH parents; the remaining knobs come from the adaptive search config
 #ifndef SEARCH_WIDTH

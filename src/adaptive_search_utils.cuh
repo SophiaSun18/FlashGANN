@@ -3,7 +3,278 @@
 #include <cuda_runtime.h>
 
 #include "include/utils.cuh"
+#include "include/hash_table.cuh"
+#include "include/distance.cuh"
+#include "include/beam_management.cuh"
+#include "include/quant.cuh"
 #include "adaptive_search_config.cuh"
+
+/*-------------------------------------------- common --------------------------------------------*/
+/**
+ * @brief Barrier over a subset of the block's warps, on a named hardware barrier instead of barrier 0.
+ * @param id named barrier id in 1 .. 15, since 0 is the one __syncthreads uses
+ * @param threads participating threads, a multiple of the warp size
+ */
+static __device__ __forceinline__ void namedsync(int id, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(threads) : "memory");
+}
+
+__host__ __device__ inline int clamp_int(int value, int lo, int hi) {
+    if (value < lo)
+        return lo;
+    if (value > hi)
+        return hi;
+    return value;
+}
+
+__host__ __device__ inline float clamp_float(float value, float lo, float hi) {
+    if (value < lo)
+        return lo;
+    if (value > hi)
+        return hi;
+    return value;
+}
+
+__host__ __device__ inline uint32_t keep_count_per_parent(uint32_t max_degree, float rho) {
+    float keep_fraction = 1.0f - rho;
+    if (keep_fraction < 0.0f)
+        keep_fraction = 0.0f;
+    if (keep_fraction > 1.0f)
+        keep_fraction = 1.0f;
+
+    uint32_t keep_count = static_cast<uint32_t>(ceilf(static_cast<float>(max_degree) * keep_fraction));
+    if (keep_count < 1)
+        keep_count = 1;
+    if (keep_count > max_degree)
+        keep_count = max_degree;
+    return keep_count;
+}
+
+/*-------------------------------------------- warp and block helpers --------------------------------------------*/
+static __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t thread_count, uint32_t *warp_counts) { // SHAME(WIDEFUNC)
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+    const int warp_id = tidx() / WARP_SIZE;
+
+    uint32_t sum = thread_count;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(FULL_MASK, sum, offset);
+    }
+    if (lane_id == 0)
+        warp_counts[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        uint32_t total = (lane_id < WARPS_PER_BLOCK) ? warp_counts[lane_id] : 0u;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(FULL_MASK, total, offset);
+        }
+        if (lane_id == 0)
+            warp_counts[0] = total;
+    }
+    __syncthreads();
+    return warp_counts[0];
+}
+
+static __device__ __forceinline__ uint32_t allocate_warp_compact_slots(
+    uint32_t accepted_count, uint32_t *compact_count, uint32_t *warp_counts, uint32_t *warp_bases) {
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+    const int warp_id = tidx() / WARP_SIZE;
+
+    if (lane_id == 0)
+        warp_counts[warp_id] = accepted_count;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        uint32_t count = (lane_id < WARPS_PER_BLOCK) ? warp_counts[lane_id] : 0u;
+        uint32_t inclusive = count;
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const uint32_t other = __shfl_up_sync(FULL_MASK, inclusive, offset);
+            if (lane_id >= offset)
+                inclusive += other;
+        }
+        if (lane_id < WARPS_PER_BLOCK) warp_bases[lane_id] = inclusive - count;
+        const uint32_t round_total = __shfl_sync(FULL_MASK, inclusive, WARPS_PER_BLOCK - 1);
+        if (lane_id == 0) {
+            const uint32_t block_base = *compact_count;
+            *compact_count = block_base + round_total;
+            warp_bases[WARPS_PER_BLOCK] = block_base;
+        }
+    }
+    __syncthreads();
+    return warp_bases[WARPS_PER_BLOCK] + warp_bases[warp_id];
+}
+
+template <typename INDEX_T, typename DISTANCE_T>
+static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
+    const INDEX_T *candidate_index, const DISTANCE_T *candidate_distance,
+    int candidate_count, INDEX_T invalid_index, uint32_t *warp_counts) {
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+    const int warp_id = tidx() / WARP_SIZE;
+
+    if (lane_id == 0)
+        warp_counts[warp_id] = 0;
+    __syncthreads();
+
+    uint32_t warp_valid_count = 0;
+    for (int base = warp_id * WARP_SIZE; base < candidate_count; base += WARPS_PER_BLOCK * WARP_SIZE) {
+        const int i = base + lane_id;
+        const bool valid = i < candidate_count && candidate_index[i] != invalid_index && candidate_distance[i] < FLT_MAX;
+        warp_valid_count += __popc(__ballot_sync(FULL_MASK, valid));
+    }
+
+    if (lane_id == 0)
+        warp_counts[warp_id] = warp_valid_count;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        uint32_t total = (lane_id < WARPS_PER_BLOCK) ? warp_counts[lane_id] : 0u;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(FULL_MASK, total, offset);
+        }
+        if (lane_id == 0)
+            warp_counts[0] = total;
+    }
+    __syncthreads();
+
+    return warp_counts[0];
+}
+
+/**
+ * @brief Whether this lane holds one of the keep_k smallest valid values, lower lane first on ties.
+ *
+ * @param value this lane's value
+ * @param valid whether this lane takes part
+ * @param keep_k number of values to keep
+ * @return whether this lane is kept
+ */
+static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) {
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    // [1] order-preserving key; + 0.0f folds -0.0f into +0.0f, invalid lanes take the largest key
+    const uint32_t bits = __float_as_uint(value + 0.0f);
+    const uint32_t flip = (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    uint32_t key = valid ? (bits ^ flip) : 0xffffffffu;
+    const int picks = min(keep_k, __popc(__ballot_sync(FULL_MASK, valid)));
+
+    // [2] each round keeps the lowest lane that holds the smallest remaining key
+    bool kept = false;
+    for (int round = 0; round < picks; ++round) {
+        const uint32_t smallest = __reduce_min_sync(FULL_MASK, key);
+        const uint32_t owners = __ballot_sync(FULL_MASK, key == smallest);
+        const bool win = lane_id == __ffs(owners) - 1;
+        kept = kept || win;
+        key = win ? 0xffffffffu : key;
+    }
+    return kept;
+#else
+    const int valid_int = valid ? 1 : 0;
+    const float my_value = valid ? value : FLT_MAX;
+    int rank = 0;
+
+#pragma unroll
+    for (int src = 0; src < WARP_SIZE; ++src) {
+        const float other_value = __shfl_sync(FULL_MASK, my_value, src);
+        const int other_valid = __shfl_sync(FULL_MASK, valid_int, src);
+        if (other_valid && (other_value < my_value || (other_value == my_value && src < lane_id))) {
+            rank++;
+        }
+    }
+
+    return valid && keep_k > 0 && rank < keep_k;
+#endif
+}
+
+/**
+ * @brief Whether one of this lane's two values is among the keep_k smallest of the warp's 64.
+ *
+ * Lane l holds positions l and l + 32; lower position first on ties.
+ *
+ * @param value the value asked about, value0 or value1
+ * @param valid whether that value takes part
+ * @param position its position, lane or lane + 32
+ * @param value0 this lane's value at position lane
+ * @param valid0 whether value0 takes part
+ * @param value1 this lane's value at position lane + 32
+ * @param valid1 whether value1 takes part
+ * @param keep_k number of values to keep
+ * @return whether the value is kept
+ */
+static __device__ __forceinline__ bool warp_keep_topk_smallest_pair_f32(
+    float value, bool valid, int position,
+    float value0, bool valid0, float value1, bool valid1, int keep_k) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int lane_id = tidx() & (WARP_SIZE - 1);
+    // [1] order-preserving keys as in warp_keep_topk_smallest_f32, invalid values take the top key
+    const uint32_t bits0 = __float_as_uint(value0 + 0.0f);
+    const uint32_t bits1 = __float_as_uint(value1 + 0.0f);
+    const uint32_t flip0 = (bits0 & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    const uint32_t flip1 = (bits1 & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    uint32_t key0 = valid0 ? (bits0 ^ flip0) : 0xffffffffu;
+    uint32_t key1 = valid1 ? (bits1 ^ flip1) : 0xffffffffu;
+    const int valid_count =
+        __popc(__ballot_sync(FULL_MASK, valid0)) + __popc(__ballot_sync(FULL_MASK, valid1));
+    const int picks = min(keep_k, valid_count);
+
+    // [2] each round keeps the lowest position that holds the smallest remaining key
+    bool kept0 = false;
+    bool kept1 = false;
+    for (int round = 0; round < picks; ++round) {
+        const uint32_t smallest = __reduce_min_sync(FULL_MASK, min(key0, key1));
+        const uint32_t owners0 = __ballot_sync(FULL_MASK, key0 == smallest);
+        const uint32_t owners1 = __ballot_sync(FULL_MASK, key1 == smallest);
+        const bool first = owners0 != 0;
+        const bool win0 = first && lane_id == __ffs(owners0) - 1;
+        const bool win1 = !first && lane_id == __ffs(owners1) - 1;
+        kept0 = kept0 || win0;
+        kept1 = kept1 || win1;
+        key0 = win0 ? 0xffffffffu : key0;
+        key1 = win1 ? 0xffffffffu : key1;
+    }
+    return valid && (position < WARP_SIZE ? kept0 : kept1);
+#else
+    const float my_value = valid ? value : FLT_MAX;
+    const int valid0_int = valid0 ? 1 : 0;
+    const int valid1_int = valid1 ? 1 : 0;
+    int rank = 0;
+
+#pragma unroll
+    for (int src = 0; src < WARP_SIZE; ++src) {
+        const float other0 = __shfl_sync(FULL_MASK, value0, src);
+        const int other0_valid = __shfl_sync(FULL_MASK, valid0_int, src);
+        const int other0_pos = src;
+        if (other0_valid && (other0 < my_value || (other0 == my_value && other0_pos < position))) {
+            rank++;
+        }
+
+        const float other1 = __shfl_sync(FULL_MASK, value1, src);
+        const int other1_valid = __shfl_sync(FULL_MASK, valid1_int, src);
+        const int other1_pos = src + WARP_SIZE;
+        if (other1_valid && (other1 < my_value || (other1 == my_value && other1_pos < position))) {
+            rank++;
+        }
+    }
+
+    return valid && keep_k > 0 && rank < keep_k;
+#endif
+}
+
+/*-------------------------------------------- rabitq --------------------------------------------*/
+template <int CODEBITS = 1>
+static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
+    const QueryFactors &qf, const uint8_t *parent_code_base, int neighbor_idx,
+    float triple_x, float factor_dq, float factor_vq,
+    float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
+    if (triple_x == FLT_MAX)
+        return exact_dist;
+
+    const float result_float = lut_reduce<1, CODEBITS>(
+        qf, parent_code_base, neighbor_idx, padded_dim, bytes_per_neighbor);
+
+    DISTANCE_T est_dist = triple_x + exact_dist;
+    est_dist += factor_dq * qf.width * result_float;
+    est_dist += factor_vq * qf.low_val;
+    return est_dist;
+}
 
 struct GPUAdaptiveSearchState {
     int adaptive_spec_degree;               // Current speculation degree.

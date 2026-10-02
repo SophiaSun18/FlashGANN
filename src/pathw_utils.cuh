@@ -1,6 +1,8 @@
 #pragma once
 
 #include "include/utils.cuh"
+#include "include/hash_table.cuh"
+#include "include/beam_management.cuh"
 
 static constexpr unsigned PATHW_BLOCK_SIZE = 32;
 static_assert(PATHW_BLOCK_SIZE == 32, "PathW and its beam primitives require one warp per block");

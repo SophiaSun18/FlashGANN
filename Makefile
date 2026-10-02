@@ -44,6 +44,10 @@ AP_HEADERS := \
 	include/metric.hpp \
 	include/quant.hpp \
 	include/utils.cuh \
+	include/hash_table.cuh \
+	include/distance.cuh \
+	include/beam_management.cuh \
+	include/quant.cuh \
 	src/adaptive_search.cuh \
 	src/adaptive_search_utils.cuh \
 	src/adaptive_search_config.cuh
@@ -74,11 +78,11 @@ gpu_cagra: main.cu gpu_search_cagra.cu include/index.hpp include/common.hpp incl
 	$(CAGRA_NVCC) $(CAGRA_FLAGS) $(CAGRA_INCLUDES) -DGPU_SEARCH_MODE=2 -o $@ main.cu gpu_search_cagra.cu $(CAGRA_LIBS)
 	mv $@ $(BIN_DIR)/
 
-gpu_pathw: main.cu gpu_search_pathw.cu include/index.hpp src/pathw_search.cuh src/pathw_utils.cuh include/utils.cuh include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp include/quant.hpp | $(BIN_DIR)
+gpu_pathw: main.cu gpu_search_pathw.cu include/index.hpp src/pathw_search.cuh src/pathw_utils.cuh include/utils.cuh include/hash_table.cuh include/beam_management.cuh include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp include/quant.hpp | $(BIN_DIR)
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=3 -o $@ main.cu gpu_search_pathw.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
-gpu_rabitq: main.cu gpu_search_rabitq.cu include/common.hpp include/distance.hpp include/data_io.hpp include/qg.hpp include/metric.hpp include/quant.hpp include/utils.cuh src/adaptive_search_config.cuh src/rabitq_utils.cuh src/rabitq_search.cuh | $(BIN_DIR)
+gpu_rabitq: main.cu gpu_search_rabitq.cu include/common.hpp include/distance.hpp include/data_io.hpp include/qg.hpp include/metric.hpp include/quant.hpp include/utils.cuh include/hash_table.cuh include/distance.cuh include/beam_management.cuh include/quant.cuh src/adaptive_search_config.cuh src/rabitq_utils.cuh src/rabitq_search.cuh | $(BIN_DIR)
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=4 -o $@ main.cu gpu_search_rabitq.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
