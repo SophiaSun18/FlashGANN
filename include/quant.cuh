@@ -3,14 +3,13 @@
 #include "utils.cuh"
 #include "quant.hpp"
 
-// Device side of the quantized distance estimate, shared by the FlashGANN and RaBitQ kernels.
-// Query preparation runs once per query block: rotate into the code space, quantize, and build
-// a lookup table of 16 entries per 4-bit scan group. Each neighbor estimate then sums the
-// entries its packed code selects and applies the factors stored beside the parent.
-
 /*-------------------------------------------- query factors --------------------------------------------*/
-// Neighbors per packed code tile: 32 keeps each neighbor's codes contiguous, smaller values
-// interleave WARP_SIZE / lanes neighbors byte by byte.
+/**
+ * @brief Packed code layout lanes of the scan: 32 keeps each neighbor's codes contiguous.
+ *
+ * Smaller values, 2 to 16, interleave WARP_SIZE / lanes neighbors byte by byte in one tile.
+ * pack_codes writes the contiguous layout only.
+ */
 #ifndef GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES
 #define GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES 32
 #endif
@@ -76,19 +75,19 @@ static __device__ inline void rotate_vector_gpu(const float *src, float *dst,
 }
 
 /**
- * @brief Apply the Fastfood sketch to one query for the TurboQuant sign stage, block cooperatively.
+ * @brief Apply the Fastfood sketch to one vector for the TurboQuant sign stage, block cooperatively.
  *
  * Mirrors FastfoodSketch::apply including both 1/sqrt(padded_dim) scales, so the sketched
  * query lands on the same scale as the constants the builder folded into the factors.
  * Unlike rotate_vector_gpu this transform is normalized.
  *
- * @param src raw query in shared memory
- * @param dst destination of padded_dim floats
- * @param flipv sign vector of the first stage
- * @param spectr singular value spectrum
- * @param flipu sign vector of the second stage
- * @param dim raw dimension
- * @param padded_dim padded dimension
+ * @param src input vector of dim floats; the search passes the rotated query
+ * @param dst destination of padded_dim floats, also the transform workspace
+ * @param flipv sign vector applied before the first transform
+ * @param spectr diagonal magnitudes applied between the transforms
+ * @param flipu sign vector applied with spectr
+ * @param dim input dimension; the search passes padded_dim
+ * @param padded_dim padded dimension, a power of two
  */
 static __device__ inline void sketch_apply(const float *src, float *dst, const float *flipv,
                                            const float *spectr, const float *flipu,
@@ -96,12 +95,12 @@ static __device__ inline void sketch_apply(const float *src, float *dst, const f
     const int tid = tidx();
     const float scale = rsqrtf(static_cast<float>(padded_dim));
 
-    // [1] sign flip of the first orthogonal factor
+    // [1] first sign flip and zero padding
     for (int i = tid; i < dim; i += blockDim.x) dst[i] = src[i] * flipv[i];
     for (int i = dim + tid; i < padded_dim; i += blockDim.x) dst[i] = 0.0f;
     __syncthreads();
 
-    // [2] first transform, then the spectrum and the second sign flip
+    // [2] first transform
     for (int len = 1; len < padded_dim; len <<= 1) {
         for (int pair = tid; pair < (padded_dim >> 1); pair += blockDim.x) {
             const int block = pair / len;
@@ -115,10 +114,11 @@ static __device__ inline void sketch_apply(const float *src, float *dst, const f
         __syncthreads();
     }
 
+    // [3] first scale, spectrum, and second sign flip
     for (int i = tid; i < padded_dim; i += blockDim.x) dst[i] *= spectr[i] * scale * flipu[i];
     __syncthreads();
 
-    // [3] second transform and the closing scale
+    // [4] second transform and the closing scale
     for (int len = 1; len < padded_dim; len <<= 1) {
         for (int pair = tid; pair < (padded_dim >> 1); pair += blockDim.x) {
             const int block = pair / len;
@@ -140,8 +140,9 @@ static __device__ inline void sketch_apply(const float *src, float *dst, const f
  * @brief Prepare a query for 1-bit RaBitQ codes: rotate, quantize, and build the lookup table.
  *
  * Coordinates are quantized to QG_BQUERY bits over the rotated query's range. Row cb of the
- * table holds the 16 subset sums of coordinates 4cb .. 4cb + 3, one per 4-bit code, so a
- * neighbor scan needs one lookup per four dimensions.
+ * table holds the 16 subset sums of coordinates 4cb .. 4cb + 3, one per 4-bit code.
+ * scratch.rotated_query and scratch.lut must already point at padded_dim floats and
+ * quant_lutbytes(padded_dim, 1) bytes.
  *
  * @param query_raw raw query in shared memory
  * @param scratch query factors, receives the rotated query, its range, the table and the query sum
@@ -251,12 +252,12 @@ static __device__ inline void query_prepare_lut_gpu(const float *query_raw, Quer
 /**
  * @brief Quantize an already transformed query and build its lookup table against a level codebook.
  *
- * Serves multi-bit RaBitQ and the TurboQuant MSE stage, and with CODEBITS 1 the TurboQuant sign
- * stage. A 4-bit scan code packs QUANT_NIBBLE_DIMS / CODEBITS dimensions, most significant first,
- * matching pack_codes. Entries and sum_q carry a gain of CODEBITS, so the scan reads them unchanged.
+ * Serves multi-bit RaBitQ, the TurboQuant MSE stage and, with CODEBITS 1, the TurboQuant sign
+ * stage. A scan code packs QUANT_NIBBLE_DIMS / CODEBITS dimensions as pack_codes does. Entries
+ * and sum_q carry a gain of CODEBITS, which the builder divides out of the table-sum factor.
  *
  * @tparam CODEBITS bits per dimension
- * @param scratch query factors holding the transformed query, receives its range, the table and the query sum
+ * @param scratch query factors whose rotated_query holds the transformed query, receives its range, the table and the query sum
  * @param levels normalized reconstruction levels, 2^CODEBITS entries spanning [0, 1], or nullptr for an even ladder
  * @param padded_dim padded dimension
  */
@@ -369,16 +370,16 @@ static __device__ inline void lut_build(QueryFactors &scratch, const float *leve
  * @brief Prepare a query for multi-bit RaBitQ or the TurboQuant MSE stage: rotate, then build the level table.
  * @tparam CODEBITS bits per dimension
  * @param query_raw raw query in shared memory
- * @param scratch query factors, receives the rotated query and the table
+ * @param scratch query factors, receives the rotated query, its range, the table and the query sum
  * @param signs_ptr sign vector of the index rotation
- * @param levels normalized levels spanning [0, 1], or nullptr for an even ladder
+ * @param levels normalized levels spanning [0, 1], or nullptr for an even ladder as multi-bit RaBitQ uses
  * @param dim raw dimension
  * @param padded_dim padded dimension
  */
 template <int CODEBITS>
 static __device__ inline void turboq_prepare_lut_gpu(
     const float *query_raw, QueryFactors &scratch, const float *signs_ptr,
-    const float *levels, int dim, int padded_dim) { // SHAME(MANYARG)
+    const float *levels, int dim, int padded_dim) {
     rotate_vector_gpu(query_raw, scratch.rotated_query, signs_ptr, dim, padded_dim);
     __syncthreads();
     lut_build<CODEBITS>(scratch, levels, padded_dim);
@@ -483,11 +484,11 @@ static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8
 }
 
 /**
- * @brief Sum one neighbor's lookup entries across a lane group, the core of every estimate.
+ * @brief Sum one neighbor's lookup entries across a lane group and apply the sign correction, shared by every estimate.
  *
- * Lanes within a group split the scan groups and reduce; only group lane 0 holds the
- * result. Returns the sign-corrected sum consumed by the distance expression. A lone lane
- * on contiguous, 16-byte aligned codes reads them through widesum.
+ * Lanes within a group split the scan groups and reduce; only group lane 0 holds the result.
+ * A lone lane on contiguous codes whose tile and bytes_per_neighbor are 16-byte aligned reads
+ * them through widesum; that alignment makes num_codebook a multiple of 32.
  *
  * @tparam LANES lanes cooperating on one neighbor
  * @tparam CODEBITS bits per dimension of this code block
@@ -496,7 +497,7 @@ static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8
  * @param neighbor_idx neighbor position within the parent
  * @param padded_dim padded dimension
  * @param bytes_per_neighbor packed code footprint of one neighbor
- * @return the reduced lookup result on group lane 0, zero elsewhere
+ * @return 2 * entry sum - qf.sum_q on group lane 0, zero on the other lanes
  */
 template <int LANES, int CODEBITS>
 static __device__ __forceinline__ float lut_reduce(
@@ -506,6 +507,7 @@ static __device__ __forceinline__ float lut_reduce(
     const int group_lane = (LANES == 1) ? 0 : (lane_id & (LANES - 1));
     const int num_codebook = (padded_dim * CODEBITS) >> 2;
 
+    // [1] locate the neighbor's tile and pick the wide path
     int in_tile = 0;
     const uint8_t *tile = lut_tile(code_block, neighbor_idx, bytes_per_neighbor, &in_tile);
 
@@ -514,6 +516,7 @@ static __device__ __forceinline__ float lut_reduce(
         wide = ((reinterpret_cast<uintptr_t>(tile) | static_cast<uintptr_t>(bytes_per_neighbor)) & 15u) == 0;
     }
 
+    // [2] sum the looked-up entries
     const uint32_t lutaddr = static_cast<uint32_t>(__cvta_generic_to_shared(qf.lut));
     uint32_t raw_sum = 0;
     if (wide) {
@@ -525,6 +528,7 @@ static __device__ __forceinline__ float lut_reduce(
         }
     }
 
+    // [3] reduce across the lane group
     if constexpr (LANES > 1) {
         unsigned group_mask = FULL_MASK;
         if constexpr (LANES != WARP_SIZE) {
@@ -537,34 +541,35 @@ static __device__ __forceinline__ float lut_reduce(
         if (group_lane != 0) return 0.0f;
     }
 
+    // [4] sign correction
     return static_cast<float>((static_cast<int32_t>(raw_sum) << 1) - qf.sum_q);
 }
 
 /**
  * @brief Estimate one neighbor's distance from its RaBitQ code, one lane group per neighbor.
  *
- * The estimate adds the neighbor's stored factors to the parent's exact distance: triple_x, the
- * table sum scaled by factor_dq and the query step, and the query offset scaled by factor_vq. A
- * padding slot, marked by triple_x == FLT_MAX, returns the parent distance on every lane.
+ * It adds to the parent's exact distance triple_x, the table sum scaled by factor_dq and the
+ * query step, and the query offset scaled by factor_vq. A padding slot, marked by
+ * triple_x == FLT_MAX, returns the parent distance on every lane.
  *
  * @tparam LANES_PER_NEIGHBOR lanes cooperating on one neighbor, 2 to 32
  * @tparam CODEBITS bits per dimension
  * @param qf prepared query factors
  * @param packed_codes_block base of the parent's packed codes
  * @param neighbor_idx neighbor position within the parent
- * @param triple_x the neighbor's constant factor
- * @param factor_dq the neighbor's table-sum coefficient
- * @param factor_vq the neighbor's query-offset coefficient
+ * @param triple_x points at the neighbor's constant factor
+ * @param factor_dq points at the neighbor's table-sum coefficient
+ * @param factor_vq points at the neighbor's query-offset coefficient
  * @param exact_dist exact distance of the parent
  * @param padded_dim padded dimension
  * @param bytes_per_neighbor packed code footprint of one neighbor
- * @return the estimated distance on group lane 0, zero on the other lanes
+ * @return the estimated distance on group lane 0, zero on the other lanes, exact_dist on every lane for a padding slot
  */
 template <int LANES_PER_NEIGHBOR, int CODEBITS = 1>
 static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
     const QueryFactors &qf, const uint8_t *packed_codes_block, int neighbor_idx,
     const float *triple_x, const float *factor_dq, const float *factor_vq,
-    float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
+    float exact_dist, int padded_dim, int bytes_per_neighbor) {
     static_assert(LANES_PER_NEIGHBOR == 2 || LANES_PER_NEIGHBOR == 4 ||
                       LANES_PER_NEIGHBOR == 8 || LANES_PER_NEIGHBOR == 16 ||
                       LANES_PER_NEIGHBOR == 32,
@@ -587,11 +592,11 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
 }
 
 /**
- * @brief Estimate one neighbor distance from the two-stage TurboQuant code, the TurboQuant scan_one_neighbor_lanes_gpu.
+ * @brief Estimate one neighbor's distance from its two-stage TurboQuant code, the counterpart of scan_one_neighbor_lanes_gpu.
  *
- * Combines an MSE-stage lookup against the rotated query with a QJL sign lookup against
- * the sketched query. Factor slots run: shared constant, then a scale and an offset
- * coefficient for each stage.
+ * Combines an MSE-stage lookup against the rotated query with a QJL sign lookup against the
+ * sketched query. Factor slots run: shared constant, then a table-sum and an offset coefficient
+ * for each stage, as encode_tbq writes them. A padding slot is marked by a shared constant of FLT_MAX.
  *
  * @tparam LANES lanes cooperating on one neighbor
  * @tparam CODEBITS bits per dimension of the MSE stage
@@ -606,7 +611,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
  * @param padded_dim padded dimension
  * @param code_bytes MSE code footprint of one neighbor
  * @param sign_bytes QJL sign footprint of one neighbor
- * @return the estimated distance on group lane 0
+ * @return the estimated distance on group lane 0, zero on the other lanes; for a padding slot FLT_MAX when LANES is 1, else zero
  */
 template <int LANES, int CODEBITS>
 static __device__ inline DISTANCE_T turbop_scan(

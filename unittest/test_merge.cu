@@ -29,7 +29,6 @@ constexpr unsigned BEAMS[] = {32, 64, 100, 128, 192, 256, 300, 384, 512, 640, 76
  * @param dist beam then candidate distances, same layout
  * @param outindex merged beam indices, TRIALS spans of topk
  * @param outdist merged beam distances, same layout
- * SHAME(WIDEFUNC)
  */
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void mergecheck(unsigned topk, unsigned cand, const uint32_t *__restrict__ index, const float *__restrict__ dist,
@@ -118,7 +117,6 @@ static void filltrial(std::mt19937 &rng, unsigned topk, unsigned cand, bool tied
  * @param outindex merged indices, topk
  * @param outdist merged distances, topk
  * @return whether the merged beam is correct
- * SHAME(MANYARG)
  */
 static bool checktrial(unsigned topk, unsigned cand, bool tied, const uint32_t *index, const float *dist,
                        const uint32_t *outindex, const float *outdist) {
@@ -148,7 +146,6 @@ static bool checktrial(unsigned topk, unsigned cand, bool tied, const uint32_t *
  * @param tied whether distances repeat
  * @param rng random source
  * @return number of trials whose merged beam is wrong
- * SHAME(WIDEFUNC)
  */
 static unsigned checkshape(unsigned topk, unsigned cand, bool tied, std::mt19937 &rng) {
     const unsigned total = topk + cand;

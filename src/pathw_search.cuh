@@ -2,6 +2,36 @@
 
 #include "pathw_utils.cuh"
 
+/**
+ * @brief PathWeaver-style beam search kernel for the PathW mode, launched by IndexGraph::search_pathw.
+ *
+ * Block blockIdx.x serves query blockIdx.x with one warp. Iterations before prune_iteration_limit
+ * use sign-bit pruning, later ones exact distances and the visited hash.
+ *
+ * Shared memory order: query (dim floats), beam (padded_beam_size) plus candidate IDs, their
+ * distances, visited hash, parent list, query sign words, expander count.
+ *
+ * @tparam T vector element type
+ * @tparam VECTOR_DIM compile-time dimension, 0 to use runtime_dim
+ * @tparam BEAM_SIZE compile-time beam size, 0 to use runtime_beam
+ * @param K results per query
+ * @param nq number of queries
+ * @param runtime_dim vector dimension
+ * @param runtime_beam beam size and iteration limit
+ * @param bitlen visited hash bit length
+ * @param npoints number of data rows
+ * @param d_queries nq x dim queries
+ * @param d_data row-major data
+ * @param d_sign_bit per-node neighbor sign words, or nullptr to disable pruning
+ * @param d_results nq x K output IDs
+ * @param d_result_dists nq x K output distances
+ * @param d_iters nq outputs of expanded node counts
+ * @param entry_point seed node
+ * @param gg device graph
+ * @param neighbor_keep_ratio fraction of neighbors kept by pruning; pruning is off unless in (0, 1)
+ * @param iteration_prune_ratio fraction of the iteration limit that uses pruning
+ * @param use_ip true for negated inner product, false for squared L2
+ */
 template <typename T, int VECTOR_DIM = 0, int BEAM_SIZE = 0>
 static __global__ __launch_bounds__(PATHW_BLOCK_SIZE)
 void PathWBeamSearch(
@@ -34,7 +64,7 @@ void PathWBeamSearch(
     const int tid = threadIdx.x;
     uint32_t expanded = 0;
 
-    // initialize the shared memory
+    // [1] carve shared memory
     extern __shared__ uint32_t smem[];
     DATA_T* query_buffer = reinterpret_cast<DATA_T*>(smem);
     INDEX_T* result_indices_buffer = reinterpret_cast<INDEX_T*>(query_buffer + dim);
@@ -45,10 +75,9 @@ void PathWBeamSearch(
     uint32_t* num_expanders = query_sign_bits_buffer + static_cast<size_t>(SEARCH_WIDTH) * packed_dim;
     if (tid == 0) num_expanders[0] = 0;
 
-    // initialize the hash table
+    // [2] clear the hash, load the query, clear the beam and candidates
     hashtable_init(visited_hash_buffer, bitlen);
 
-    // load query and initialize result buffer
     for (uint32_t i = tid; i < dim; i += blockDim.x) {
         query_buffer[i] = d_queries[static_cast<size_t>(query_id) * dim + i];
     }
@@ -58,7 +87,7 @@ void PathWBeamSearch(
     }
     __syncthreads();
 
-    // Upstream starts from the seed's neighbors, evaluated without pruning.
+    // [3] as upstream, evaluate the seed's neighbors without pruning, then drop the seed
     const bool valid_entry = entry_point != MAX_INDEX && entry_point < npoints;
     if (tid == 0) {
         result_indices_buffer[0] = valid_entry ? entry_point : MAX_INDEX;
@@ -74,15 +103,15 @@ void PathWBeamSearch(
     if (tid == 0) result_indices_buffer[0] = MAX_INDEX;
     __syncthreads();
 
-    // start the main search loop
+    // [4] main loop, at most beam_sz iterations
     for (int iter = 0; iter < iteration_limit; ++iter) {
-        // hash table periodical reset
+        // [5] clear the hash every SMALL_HASH_RESET_INTERVAL iterations
         if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
             hashtable_init(visited_hash_buffer, bitlen);
         }
         __syncthreads();
 
-        // sort the candidates and select the top-k
+        // [6] merge candidates into the beam, clear slots past logical_beam_size
         dispatch_beam_management(result_indices_buffer, result_distances_buffer, nullptr,
                                  candidate_buffer_size, padded_beam_size, iter == 0);
         __syncthreads();
@@ -93,12 +122,12 @@ void PathWBeamSearch(
         }
         __syncthreads();
 
-        // check termination condition
+        // [7] stop after the last merge
         if (iter + 1 == iteration_limit) {
             break;
         }
 
-        // pick the next expander
+        // [8] pick the next unexpanded beam node
         if (tid < WARP_SIZE) {
             const uint32_t picked = pick_expanders(
                 SEARCH_WIDTH, parent_list_buffer, logical_beam_size, result_indices_buffer);
@@ -108,7 +137,7 @@ void PathWBeamSearch(
         }
         __syncthreads();
 
-        // restore the hash table
+        // [9] after a clear, reinsert the beam into the hash
         if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
             const unsigned first_tid = ((blockDim.x <= WARP_SIZE) ? 0 : WARP_SIZE);
             hashtable_restore(
@@ -120,11 +149,13 @@ void PathWBeamSearch(
         }
         __syncthreads();
 
+        // [10] stop when no node is left to expand
         if (num_expanders[0] == 0) {
             break;
         }
         expanded += num_expanders[0];
 
+        // [11] expand: sign-bit pruning before prune_iteration_limit, else exact with the hash
         if (d_sign_bit != nullptr && neighbor_keep_ratio > 0.0f &&
             neighbor_keep_ratio < 1.0f && iter < prune_iteration_limit) {
             pathw_compute_candidates_with_signbit_pruning<T, TEAM_SIZE>(
@@ -147,7 +178,7 @@ void PathWBeamSearch(
         __syncthreads();
     }
 
-    // Reproduce upstream's final merge and direct output, including duplicate IDs.
+    // [12] as upstream, merge once more and write the top K, duplicate IDs included
     dispatch_beam_management(result_indices_buffer, result_distances_buffer, nullptr,
                              candidate_buffer_size, padded_beam_size, false);
     __syncthreads();

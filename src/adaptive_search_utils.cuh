@@ -11,7 +11,7 @@
 
 /*-------------------------------------------- common --------------------------------------------*/
 /**
- * @brief Barrier over a subset of the block's warps, on a named hardware barrier instead of barrier 0.
+ * @brief Barrier over a subset of the block's warps on a named hardware barrier, used by the hash-reset warps of QuantizedPrunedBeamSearch.
  * @param id named barrier id in 1 .. 15, since 0 is the one __syncthreads uses
  * @param threads participating threads, a multiple of the warp size
  */
@@ -19,6 +19,13 @@ static __device__ __forceinline__ void namedsync(int id, int threads) {
     asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(threads) : "memory");
 }
 
+/**
+ * @brief Clamp an int to [lo, hi], used by keep_count_for_expander.
+ * @param value value to clamp
+ * @param lo lower bound
+ * @param hi upper bound
+ * @return the clamped value
+ */
 __host__ __device__ inline int clamp_int(int value, int lo, int hi) {
     if (value < lo)
         return lo;
@@ -27,6 +34,13 @@ __host__ __device__ inline int clamp_int(int value, int lo, int hi) {
     return value;
 }
 
+/**
+ * @brief Clamp a float to [lo, hi], used by update_adaptive_state.
+ * @param value value to clamp
+ * @param lo lower bound
+ * @param hi upper bound
+ * @return the clamped value
+ */
 __host__ __device__ inline float clamp_float(float value, float lo, float hi) {
     if (value < lo)
         return lo;
@@ -35,6 +49,12 @@ __host__ __device__ inline float clamp_float(float value, float lo, float hi) {
     return value;
 }
 
+/**
+ * @brief Neighbors of one parent kept at pruning ratio rho, the rho term of keep_count_for_expander.
+ * @param max_degree neighbors of the parent
+ * @param rho fraction pruned, clamped to [0, 1]
+ * @return ceil(max_degree * (1 - rho)), within [1, max_degree]
+ */
 __host__ __device__ inline uint32_t keep_count_per_parent(uint32_t max_degree, float rho) {
     float keep_fraction = 1.0f - rho;
     if (keep_fraction < 0.0f)
@@ -51,7 +71,16 @@ __host__ __device__ inline uint32_t keep_count_per_parent(uint32_t max_degree, f
 }
 
 /*-------------------------------------------- warp and block helpers --------------------------------------------*/
-static __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t thread_count, uint32_t *warp_counts) { // SHAME(WIDEFUNC)
+/**
+ * @brief Block-wide sum of one count per thread, used to count phase-1 estimates within the kth cutoff.
+ *
+ * Every thread of the block must call it; it holds two __syncthreads.
+ *
+ * @param thread_count this thread's count
+ * @param warp_counts shared scratch of WARPS_PER_BLOCK counters
+ * @return the block total, on every thread
+ */
+static __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t thread_count, uint32_t *warp_counts) {
     const int lane_id = tidx() & (WARP_SIZE - 1);
     const int warp_id = tidx() / WARP_SIZE;
 
@@ -75,6 +104,18 @@ static __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t thread_
     return warp_counts[0];
 }
 
+/**
+ * @brief Reserve consecutive candidate slots for each warp's accepted children, used by the phase-2 compaction.
+ *
+ * Every thread of the block must call it. Warps take slots in warp order after the current
+ * *compact_count, which grows by the block total.
+ *
+ * @param accepted_count this warp's accepted children, same on every lane
+ * @param compact_count shared count of slots taken so far, updated
+ * @param warp_counts shared scratch of WARPS_PER_BLOCK counters
+ * @param warp_bases shared scratch of WARPS_PER_BLOCK + 1 slot bases
+ * @return the first slot of this warp
+ */
 static __device__ __forceinline__ uint32_t allocate_warp_compact_slots(
     uint32_t accepted_count, uint32_t *compact_count, uint32_t *warp_counts, uint32_t *warp_bases) {
     const int lane_id = tidx() & (WARP_SIZE - 1);
@@ -104,6 +145,21 @@ static __device__ __forceinline__ uint32_t allocate_warp_compact_slots(
     return warp_bases[WARPS_PER_BLOCK] + warp_bases[warp_id];
 }
 
+/**
+ * @brief Count the valid entries of a candidate buffer, used by phase 1 to decide whether estimation is needed.
+ *
+ * Every thread of the block must call it. An entry is valid when its index is not invalid_index
+ * and its distance is below FLT_MAX.
+ *
+ * @tparam INDEX_T index type
+ * @tparam DISTANCE_T distance type
+ * @param candidate_index candidate ids
+ * @param candidate_distance candidate distances
+ * @param candidate_count entries to scan
+ * @param invalid_index id marking an empty entry
+ * @param warp_counts shared scratch of WARPS_PER_BLOCK counters
+ * @return the valid count, on every thread
+ */
 template <typename INDEX_T, typename DISTANCE_T>
 static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
     const INDEX_T *candidate_index, const DISTANCE_T *candidate_distance,
@@ -140,7 +196,9 @@ static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
 }
 
 /**
- * @brief Whether this lane holds one of the keep_k smallest valid values, lower lane first on ties.
+ * @brief Whether this lane holds one of the keep_k smallest valid values of the warp, the degree-32 phase-2 selection.
+ *
+ * Lower lane first on ties.
  *
  * @param value this lane's value
  * @param valid whether this lane takes part
@@ -185,7 +243,7 @@ static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, 
 }
 
 /**
- * @brief Whether one of this lane's two values is among the keep_k smallest of the warp's 64.
+ * @brief Whether one of this lane's two values is among the keep_k smallest of the warp's 64, the degree-64 phase-2 selection.
  *
  * Lane l holds positions l and l + 32; lower position first on ties.
  *
@@ -258,12 +316,30 @@ static __device__ __forceinline__ bool warp_keep_topk_smallest_pair_f32(
 #endif
 }
 
-/*-------------------------------------------- rabitq --------------------------------------------*/
+/*-------------------------------------------- estimation --------------------------------------------*/
+/**
+ * @brief Estimate one neighbor's distance from its RaBitQ code on a single lane, used by the phase-2 paths.
+ *
+ * The one-lane form of scan_one_neighbor_lanes_gpu with the factors passed by value. A padding
+ * slot, marked by triple_x == FLT_MAX, returns exact_dist.
+ *
+ * @tparam CODEBITS bits per dimension
+ * @param qf prepared query factors
+ * @param parent_code_base base of the parent's packed codes
+ * @param neighbor_idx neighbor position within the parent
+ * @param triple_x the neighbor's constant factor
+ * @param factor_dq the neighbor's table-sum coefficient
+ * @param factor_vq the neighbor's query-offset coefficient
+ * @param exact_dist exact distance of the parent
+ * @param padded_dim padded dimension
+ * @param bytes_per_neighbor packed code footprint of one neighbor
+ * @return the estimated distance
+ */
 template <int CODEBITS = 1>
 static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     const QueryFactors &qf, const uint8_t *parent_code_base, int neighbor_idx,
     float triple_x, float factor_dq, float factor_vq,
-    float exact_dist, int padded_dim, int bytes_per_neighbor) { // SHAME(MANYARG)
+    float exact_dist, int padded_dim, int bytes_per_neighbor) {
     if (triple_x == FLT_MAX)
         return exact_dist;
 
@@ -276,23 +352,40 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     return est_dist;
 }
 
+/*-------------------------------------------- adaptive policy --------------------------------------------*/
+/**
+ * @brief Adaptive policy state of one query, kept in shared memory by QuantizedPrunedBeamSearch and written by warp 0 lane 0.
+ */
 struct GPUAdaptiveSearchState {
-    int adaptive_spec_degree;               // Current speculation degree.
-    float adaptive_rho;                     // Current rho value.
-    int policy_iters;                       // Number of policy updates.
-    INDEX_T top1_node;                      // Last top-1 node.
-    int top1_stall_iters;                   // Top-1 stall checks.
-    bool warmup_done;                       // Whether AP has switched to phase 2.
-    DISTANCE_T entry_distance;              // Entry-point distance.
-    DISTANCE_T last_expander_distance;      // Previous expander distance.
-    DISTANCE_T current_expander_distance;   // Current expander distance.
+    int adaptive_spec_degree;               // theta, parents expanded per iteration
+    float adaptive_rho;                     // rho, fraction of each parent's neighbors pruned
+    int policy_iters;                       // policy updates so far
+    INDEX_T top1_node;                      // beam head at the last iteration, expanded bit cleared
+    int top1_stall_iters;                   // consecutive iterations with an unchanged top1_node
+    bool warmup_done;                       // whether the policy has switched to phase 2
+    DISTANCE_T entry_distance;              // exact entry-point distance, the progress denominator
+    DISTANCE_T last_expander_distance;      // distance of the previously selected expander
+    DISTANCE_T current_expander_distance;   // distance of the latest selected expander
 };
 
+/**
+ * @brief Phase-2 rho that keeps MIN_PHASE2_KEEP of degree neighbors, computed by gpu_search_adaptive as phase2_rho.
+ * @param degree graph degree
+ * @return 1 - MIN_PHASE2_KEEP / degree, or RHO_MIN when degree is at most MIN_PHASE2_KEEP
+ */
 static __host__ __forceinline__ float compute_max_rho_bound(uint32_t degree) {
     if (degree <= static_cast<uint32_t>(MIN_PHASE2_KEEP)) return RHO_MIN;
     return 1.0f - static_cast<float>(MIN_PHASE2_KEEP) / static_cast<float>(degree);
 }
 
+/**
+ * @brief Distance of the K-th beam entry, the cutoff that tightens the per-parent keep count.
+ * @param K results per query
+ * @param beam_sz beam size
+ * @param topk_index sorted beam ids
+ * @param topk_distance sorted beam distances
+ * @return distance at position min(K, beam_sz) - 1, or FLT_MAX while the last beam slot is empty
+ */
 static __device__ __forceinline__ DISTANCE_T get_current_kth_cutoff(
     int K, int beam_sz, const INDEX_T* topk_index, const DISTANCE_T* topk_distance) {
     if (topk_index[beam_sz - 1] == MAX_INDEX) return FLT_MAX;
@@ -300,6 +393,13 @@ static __device__ __forceinline__ DISTANCE_T get_current_kth_cutoff(
     return topk_distance[kth_pos];
 }
 
+/**
+ * @brief Count consecutive iterations with an unchanged beam head, the phase-switch signal.
+ * @param topk_index sorted beam ids
+ * @param previous_state policy state of the previous iteration
+ * @param current_top1 receives the beam head with the expanded bit cleared
+ * @return previous_state.top1_stall_iters + 1 when the head is unchanged after the first policy update, else 0
+ */
 static __device__ __forceinline__ int update_head_stall_counter(
     const INDEX_T* topk_index, const GPUAdaptiveSearchState& previous_state, INDEX_T* current_top1) {
     *current_top1 = topk_index[0] & 0x7fffffffu;
@@ -309,6 +409,15 @@ static __device__ __forceinline__ int update_head_stall_counter(
     return 0;
 }
 
+/**
+ * @brief Record the distance of the last selected parent as the current expander distance, for update_expander_progress.
+ *
+ * The previous current distance, or entry_distance when there is none, becomes the last expander distance.
+ *
+ * @param keep_expanding number of selected parents, at least 1
+ * @param parent_distance_list exact distances of the selected parents
+ * @param state policy state, updated
+ */
 static __device__ __forceinline__ void record_selected_expander_dist(
     uint32_t keep_expanding, const DISTANCE_T* parent_distance_list, GPUAdaptiveSearchState* state) {
     const DISTANCE_T selected_expander_distance = parent_distance_list[keep_expanding - 1];
@@ -319,6 +428,16 @@ static __device__ __forceinline__ void record_selected_expander_dist(
     state->current_expander_distance = selected_expander_distance;
 }
 
+/**
+ * @brief Expander progress since the previous iteration, the rate that raises phase-1 rho.
+ *
+ * A missing last distance falls back to entry_distance, a missing current one to the last.
+ *
+ * @param previous_state policy state of the previous iteration
+ * @param last_expander_distance receives the resolved last expander distance
+ * @param current_expander_distance receives the resolved current expander distance
+ * @return (last - current) / |entry_distance| within [0, 1], or 0 when not finite
+ */
 static __device__ __forceinline__ float update_expander_progress(
     const GPUAdaptiveSearchState& previous_state,
     DISTANCE_T* last_expander_distance, DISTANCE_T* current_expander_distance) {
@@ -342,6 +461,16 @@ static __device__ __forceinline__ float update_expander_progress(
     return progress < 1.0f ? progress : 1.0f;
 }
 
+/**
+ * @brief Policy state of phase 2: PHASE2_THETA parents at phase2_rho, with warmup_done set.
+ * @param current_top1 current beam head
+ * @param head_stall_iters consecutive iterations with an unchanged head
+ * @param last_expander_distance resolved last expander distance
+ * @param current_expander_distance resolved current expander distance
+ * @param previous_state policy state of the previous iteration
+ * @param phase2_rho rho of phase 2
+ * @return the next policy state
+ */
 static __device__ __forceinline__ GPUAdaptiveSearchState apply_stage2_state(
     INDEX_T current_top1, int head_stall_iters, DISTANCE_T last_expander_distance, DISTANCE_T current_expander_distance,
     const GPUAdaptiveSearchState& previous_state, float phase2_rho) {
@@ -359,6 +488,21 @@ static __device__ __forceinline__ GPUAdaptiveSearchState apply_stage2_state(
     return state;
 }
 
+/**
+ * @brief Policy state of phase 1: PHASE1_THETA parents, rho raised by expander progress.
+ *
+ * rho starts at PHASE1_RHO and grows by distance_reduction_rate times the span up to phase2_rho,
+ * or up to RHO_MAX when phase2_rho is not above PHASE1_RHO; it stays at least RHO_MIN.
+ *
+ * @param current_top1 current beam head
+ * @param head_stall_iters consecutive iterations with an unchanged head
+ * @param last_expander_distance resolved last expander distance
+ * @param current_expander_distance resolved current expander distance
+ * @param distance_reduction_rate progress from update_expander_progress
+ * @param previous_state policy state of the previous iteration
+ * @param phase2_rho rho of phase 2
+ * @return the next policy state
+ */
 static __device__ __forceinline__ GPUAdaptiveSearchState update_adaptive_state(
     INDEX_T current_top1, int head_stall_iters, DISTANCE_T last_expander_distance,
     DISTANCE_T current_expander_distance, float distance_reduction_rate,
@@ -389,6 +533,18 @@ static __device__ __forceinline__ GPUAdaptiveSearchState update_adaptive_state(
     return state;
 }
 
+/**
+ * @brief Neighbors one parent keeps after pruning, used by every expansion path.
+ *
+ * The smaller of the rho keep count and the parent's share of BUFFER_BOUND (WARP_SIZE for up to
+ * 32 neighbors) over theta parents; with a valid cutoff, also at most kth_near_count. Never below 1.
+ *
+ * @param active_neighbors neighbors of the parent
+ * @param state policy state holding theta and rho
+ * @param kth_cutoff_valid whether kth_near_count applies
+ * @param kth_near_count estimates within the kth cutoff
+ * @return the keep count, within [1, active_neighbors]
+ */
 static __device__ __forceinline__ int keep_count_for_expander(
     uint32_t active_neighbors, const GPUAdaptiveSearchState& state,
     bool kth_cutoff_valid = false, uint32_t kth_near_count = 0) {
@@ -409,6 +565,12 @@ static __device__ __forceinline__ int keep_count_for_expander(
     return clamp_int(max_keep, 1, active_count);
 }
 
+/*-------------------------------------------- sizing --------------------------------------------*/
+/**
+ * @brief Candidate buffer entries before rounding to a power of two, shared by the kernel, its driver and calculate_shared_mem_size.
+ * @param max_degree graph degree
+ * @return BUFFER_BOUND, at most WARP_SIZE for degrees up to 32 and at most THETA_MAX * max_degree
+ */
 static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t max_degree) {
     const uint32_t max_capacity = static_cast<uint32_t>(THETA_MAX) * max_degree;
     uint32_t capacity = static_cast<uint32_t>(BUFFER_BOUND);
@@ -419,48 +581,90 @@ static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t ma
     return capacity;
 }
 
+/**
+ * @brief Bytes of dynamic shared memory of QuantizedPrunedBeamSearch, used by gpu_search_adaptive for the launch.
+ *
+ * Covers, in kernel order: TOP_K_INDEX + CANDIDATE_INDEX, TOP_K_DISTANCE + CANDIDATE_DISTANCE, visited
+ * hash table, PARENT_LIST, PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, then uint4-aligned
+ * LUT_BUFFER, SIGN_LUT_BUFFER (TurboQuant only), and one uint4-aligned region holding the larger of
+ * the rotated (+ sketch) query and the candidate radix scratch.
+ *
+ * @param dim raw dimension
+ * @param beam_sz beam size
+ * @param max_deg graph degree
+ * @param bitlen visited table bit length
+ * @param bits total bits per dimension
+ * @param quant quantizer family
+ * @return bytes of dynamic shared memory
+ */
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg, int bitlen,
-                                                          int bits, QuantType quant) { // SHAME(MANYARG)
+                                                          int bits, QuantType quant) {
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     const size_t candidate_buffer_size = round_up_power2_u32(candidate_buffer_capacity(static_cast<uint32_t>(max_deg)));
     const uint32_t padded_beam_size = effective_sort_beam_size(static_cast<uint32_t>(beam_sz));
     const size_t result_buffer_size = static_cast<size_t>(padded_beam_size) + candidate_buffer_size;
     size_t size = 0;
-    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);       // visited-node hash table
-    size += result_buffer_size * sizeof(INDEX_T);              // TOP_K_INDEX + CANDIDATE_INDEX
-    size += result_buffer_size * sizeof(DISTANCE_T);           // TOP_K_DISTANCE + CANDIDATE_DISTANCE
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                    // PARENT_LIST: beam positions/ranks selected by pick_expanders
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                    // PARENT_NODE_LIST: graph node ids for selected parents
-    size += SEARCH_WIDTH * sizeof(DISTANCE_T);                 // PARENT_DISTANCE_LIST: exact distances for selected parents
-    size += dim * sizeof(DATA_T);                              // QUERY_BUFFER
+    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);
+    size += result_buffer_size * sizeof(INDEX_T);
+    size += result_buffer_size * sizeof(DISTANCE_T);
+    size += SEARCH_WIDTH * sizeof(INDEX_T);
+    size += SEARCH_WIDTH * sizeof(INDEX_T);
+    size += SEARCH_WIDTH * sizeof(DISTANCE_T);
+    size += dim * sizeof(DATA_T);
     const bool prod = quant == QUANT_TBQ;
     const int stage_bits = prod ? quant_stage(bits) : bits;
     size = static_cast<size_t>(align_up_uintptr(size, alignof(uint4)));
-    size += quant_lutbytes(padded_dim, stage_bits) * sizeof(uint8_t); // LUT_BUFFER
+    size += quant_lutbytes(padded_dim, stage_bits) * sizeof(uint8_t);
     if (prod) {
-        size += quant_lutbytes(padded_dim, 1) * sizeof(uint8_t); // SIGN_LUT_BUFFER
+        size += quant_lutbytes(padded_dim, 1) * sizeof(uint8_t);
     }
-    // one region for buffers never live together: rotated (+ sketch) query, radix scratch
     size = static_cast<size_t>(align_up_uintptr(size, alignof(uint4)));
-    size_t transient = padded_dim * sizeof(float) * (prod ? 2 : 1); // ROTATED_QUERY_BUFFER (+ SKETCH)
+    size_t transient = padded_dim * sizeof(float) * (prod ? 2 : 1);
     if (!GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT && candidate_buffer_size > 256) {
         const size_t radix = align_up_uintptr(size, candidate_radix_sort_scratch_alignment()) - size
-            + candidate_radix_sort_scratch_bytes();             // candidate radix sort scratch
+            + candidate_radix_sort_scratch_bytes();
         transient = transient > radix ? transient : radix;
     }
     size += transient;
     return static_cast<uint32_t>(size);
 }
 
-
+/*-------------------------------------------- expansion --------------------------------------------*/
 /**
- * @brief Single-expander expansion, the whole block working on one parent's neighbors.
+ * @brief Phase-1 expansion of QuantizedPrunedBeamSearch, the whole block working on parent_node_list[0].
  *
- * Gathers the unvisited neighbors into the candidate buffer, estimates and prunes them only when
- * they exceed the keep budget, then inserts the kept children and computes their exact distances.
+ * Gathers the unvisited neighbors, estimates and prunes them only when they exceed the keep budget,
+ * then inserts the kept children into the visited table and writes their exact distances. Every
+ * other candidate slot ends as MAX_INDEX / FLT_MAX. Every thread of the block must call it.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
+ * @param padded_dim padded dimension
+ * @param dim raw dimension
+ * @param max_degree graph degree
+ * @param npoints number of indexed points; neighbor ids at or above it are skipped
+ * @param qf prepared query factors
+ * @param qb prepared sketch query factors, read only when turbop
+ * @param d_qg_data index rows
+ * @param query query in shared memory, dim values
+ * @param row_offset row stride of d_qg_data in floats
+ * @param neighbor_offset offset of the neighbor ids within a row
+ * @param code_offset offset of the neighbor codes within a row
+ * @param sign_offset offset of the neighbor sign codes within a row
+ * @param factor_offset offset of the neighbor factors within a row
+ * @param hash_table visited hash table
+ * @param bitlen visited table bit length
+ * @param parent_node_list selected parent ids
+ * @param parent_distance_list exact distances of the selected parents
+ * @param candidate_buffer_size candidate buffer entries
+ * @param adaptive_state policy state holding theta and rho
+ * @param current_kth_cutoff distance of the K-th beam entry, FLT_MAX when unset
+ * @param candidate_index candidate ids, rewritten
+ * @param candidate_distance candidate distances, rewritten
+ * @param candidate_radix_scratch radix sort scratch, used above 256 candidates
+ * @param kth_near_count shared scratch receiving the estimates within current_kth_cutoff
+ * @param warp_stat_counts shared scratch of WARPS_PER_BLOCK counters
+ * @param use_ip whether distances are inner product rather than L2
  */
 template <int CODEBITS, bool turbop>
 static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
@@ -488,7 +692,7 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
     const float* parent_row = parent_valid ? d_qg_data + static_cast<size_t>(parent_node) * row_offset : nullptr;
     const vidType* parent_neighbors = parent_valid ? reinterpret_cast<const vidType*>(parent_row + neighbor_offset) : nullptr;
 
-    // gather valid neighbors into shared memory
+    // [1] gather the parent's unvisited neighbors into the candidate buffer
     for (int i = tidx(); i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
         INDEX_T child_id = MAX_INDEX;
         if (i < static_cast<int>(candidate_work_count) && parent_valid) {
@@ -502,15 +706,15 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
     }
     __syncthreads();
 
-    // skip estimation when all valid neighbors fit within the keep budget
+    // [2] count valid neighbors; estimation is skipped when they all fit the keep budget
     const int keep_count = keep_count_for_expander(candidate_work_count, *adaptive_state);
     const uint32_t valid_candidate_count = count_valid_candidates_warp_reduced(
         candidate_index, candidate_distance, static_cast<int>(candidate_work_count), MAX_INDEX, warp_stat_counts);
     const bool keep_all_valid = keep_count >= static_cast<int>(valid_candidate_count);
     int effective_keep_count = keep_count;
 
-    // estimate and prune only when valid candidates exceed the keep budget
     if (!keep_all_valid) {
+        // [3] estimate each valid neighbor, one lane group of GPU_RABITQ_FASTSCAN_SUBWARP_LANES per neighbor
         const float* parent_factors = parent_row + factor_offset;
         const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(parent_row + code_offset);
         const uint8_t* parent_sign_base = reinterpret_cast<const uint8_t*>(parent_row + sign_offset);
@@ -550,7 +754,7 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
         }
         __syncthreads();
 
-        // tighten the keep count using the current kth-result cutoff when available
+        // [4] tighten the keep count by the estimates within current_kth_cutoff, when the beam is full
         const DISTANCE_T kth_cutoff = current_kth_cutoff;
         const bool kth_cutoff_valid = isfinite(static_cast<float>(kth_cutoff)) && kth_cutoff < FLT_MAX;
         if (tidx() == 0) {
@@ -573,7 +777,7 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
 
         effective_keep_count = keep_count_for_expander(candidate_work_count, *adaptive_state, kth_cutoff_valid, *kth_near_count);
 
-        // sort estimated candidates and invalidate entries past the keep budget
+        // [5] sort the estimates and invalidate entries past the keep count
         dispatch_candidate_sort(
             candidate_index, candidate_distance, candidate_buffer_size,
             candidate_radix_scratch);
@@ -588,7 +792,7 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
         __syncthreads();
     }
 
-    // insert kept children and compute their exact distances for the next merge
+    // [6] one warp per kept child: lane 0 inserts it, __syncwarp keeps the SHFL broadcasts native
     const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : effective_keep_count;
     for (int i = warpidx(); i < admit_scan_count; i += WARPS_PER_BLOCK) {
         INDEX_T child_id = MAX_INDEX;
@@ -604,7 +808,6 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
                 candidate_distance[i] = FLT_MAX;
             }
         }
-        // reconverge after lane 0's insert so the broadcasts compile to native shuffles
         __syncwarp();
         child_id = SHFL(child_id, 0);
         inserted = SHFL(inserted, 0);
@@ -620,14 +823,38 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
 }
 
 /**
- * @brief Speculative phase-2 expansion for parents of at most 32 neighbors.
+ * @brief Phase-2 expansion of QuantizedPrunedBeamSearch for at most 32 neighbors, one warp per parent.
  *
- * Warp w of a wave takes parent task_base + w, lane l its neighbor l. Every warp of a wave
- * checks and prunes before any inserts, then compacts inserted children into the candidate buffer.
+ * Warp w of a wave takes parent task_base + w, lane l its neighbor l. All warps check and prune
+ * before any insert; inserted children past candidate_collect_capacity stay visited but are
+ * dropped. Every thread of the block must call it.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
- * SHAME(TALLFUNC) SHAME(WIDEFUNC) SHAME(MANYARG)
+ * @param padded_dim padded dimension
+ * @param max_degree graph degree, the stride between factor slots
+ * @param npoints number of indexed points; neighbor ids at or above it are skipped
+ * @param qf prepared query factors
+ * @param qb prepared sketch query factors, read only when turbop
+ * @param d_qg_data index rows
+ * @param row_offset row stride of d_qg_data in floats
+ * @param neighbor_offset offset of the neighbor ids within a row
+ * @param code_offset offset of the neighbor codes within a row
+ * @param sign_offset offset of the neighbor sign codes within a row
+ * @param factor_offset offset of the neighbor factors within a row
+ * @param hash_table visited hash table
+ * @param bitlen visited table bit length
+ * @param parent_node_list selected parent ids
+ * @param parent_distance_list exact distances of the selected parents
+ * @param keep_expanding number of selected parents
+ * @param parent_work_count neighbors scanned per parent
+ * @param adaptive_state policy state holding theta and rho
+ * @param current_kth_cutoff distance of the K-th beam entry, FLT_MAX when unset
+ * @param candidate_index compacted child ids
+ * @param candidate_distance compacted child distances, set to FLT_MAX
+ * @param compact_candidate_count shared count of compacted children, may exceed candidate_collect_capacity
+ * @param candidate_collect_capacity candidate slots available
+ * @param warp_stat_counts shared scratch of 2 * WARPS_PER_BLOCK + 1 counters
  */
 template <int CODEBITS, bool turbop>
 static __device__ __forceinline__ void collect_phase2_degree32_candidates_warp_local(
@@ -747,15 +974,38 @@ static __device__ __forceinline__ void collect_phase2_degree32_candidates_warp_l
 }
 
 /**
- * @brief Speculative phase-2 expansion for parents of 33 to 64 neighbors, ranked together.
+ * @brief Phase-2 expansion of QuantizedPrunedBeamSearch for 33 to 64 neighbors, one warp per parent.
  *
- * Warp w of a wave takes parent task_base + w, lane l its neighbors l and l + 32 in registers.
- * All 64 are checked and estimated before one selection keeps the smallest across both halves.
- * Every warp of a wave checks and prunes before any inserts.
+ * Warp w of a wave takes parent task_base + w, lane l its neighbors l and l + 32, selected
+ * together. All warps check and prune before any insert; inserted children past
+ * candidate_collect_capacity stay visited but are dropped. Every thread of the block must call it.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
- * SHAME(TALLFUNC) SHAME(WIDEFUNC) SHAME(MANYARG)
+ * @param padded_dim padded dimension
+ * @param max_degree graph degree, the stride between factor slots
+ * @param npoints number of indexed points; neighbor ids at or above it are skipped
+ * @param qf prepared query factors
+ * @param qb prepared sketch query factors, read only when turbop
+ * @param d_qg_data index rows
+ * @param row_offset row stride of d_qg_data in floats
+ * @param neighbor_offset offset of the neighbor ids within a row
+ * @param code_offset offset of the neighbor codes within a row
+ * @param sign_offset offset of the neighbor sign codes within a row
+ * @param factor_offset offset of the neighbor factors within a row
+ * @param hash_table visited hash table
+ * @param bitlen visited table bit length
+ * @param parent_node_list selected parent ids
+ * @param parent_distance_list exact distances of the selected parents
+ * @param keep_expanding number of selected parents
+ * @param parent_work_count neighbors scanned per parent
+ * @param adaptive_state policy state holding theta and rho
+ * @param current_kth_cutoff distance of the K-th beam entry, FLT_MAX when unset
+ * @param candidate_index compacted child ids
+ * @param candidate_distance compacted child distances, set to FLT_MAX
+ * @param compact_candidate_count shared count of compacted children, may exceed candidate_collect_capacity
+ * @param candidate_collect_capacity candidate slots available
+ * @param warp_stat_counts shared scratch of 2 * WARPS_PER_BLOCK + 1 counters
  */
 template <int CODEBITS, bool turbop>
 static __device__ __forceinline__ void collect_phase2_degree64_candidates_warp_local(

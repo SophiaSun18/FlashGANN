@@ -49,7 +49,7 @@ struct Timing {
 template <bool sorted>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void flashsort(int nq, unsigned beam, unsigned cand, unsigned iters, unsigned spec,
-               const float *__restrict__ dist, const uint32_t *__restrict__ index) { // SHAME(MANYARG) SHAME(WIDEFUNC)
+               const float *__restrict__ dist, const uint32_t *__restrict__ index) {
     const int qid = blockIdx.x;
     if (qid >= nq) return;
     const uint32_t tid = threadIdx.x;
@@ -128,7 +128,7 @@ static double elapsed(LAUNCH &&launch) {
 }
 
 /**
- * @brief Time the sorting kernel and its sort-free twin for one shape. SHAME(WIDEFUNC)
+ * @brief Time the sorting kernel and its sort-free twin for one shape.
  * @param form profiled configuration
  * @param dist device candidate distance batches
  * @param index device candidate index batches
@@ -159,7 +159,7 @@ static Timing flashrun(Shape form, const float *dist, const uint32_t *index) {
 }
 
 /**
- * @brief Print one row per shape with the isolated sort cost. SHAME(WIDEFUNC)
+ * @brief Print one row per shape with the isolated sort cost.
  * @param rows timings of every shape
  */
 static void report(const std::vector<Timing> &rows) {

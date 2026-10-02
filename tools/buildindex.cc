@@ -25,7 +25,7 @@
  * @return floats per row
  */
 static size_t layout_offsets(const BuildSpec& spec, size_t* codeoff, size_t* signoff,
-                             size_t* facoff, size_t* nbroff) { // SHAME(MANYARG)
+                             size_t* facoff, size_t* nbroff) {
     const bool prod = spec.qtype == QUANT_TBQ;
     const int stage = prod ? quant_stage(spec.codebit) : spec.codebit;
     const size_t deg = static_cast<size_t>(spec.degree);
@@ -70,7 +70,7 @@ static void read_graph(const std::string& path, const BuildSpec& spec, std::vect
  */
 static void write_index(const std::string& path, const BuildSpec& spec, const float* rows, size_t rowoff,
                         const float* flips, const std::vector<float>& sketch, float kappa,
-                        const std::vector<float>& levels, uint32_t entry) { // SHAME(MANYARG)
+                        const std::vector<float>& levels, uint32_t entry) {
     std::ofstream fout(path, std::ios::binary);
     if (!fout) throw std::runtime_error("Cannot open output index: " + path);
 
@@ -92,7 +92,12 @@ static void write_index(const std::string& path, const BuildSpec& spec, const fl
     if (!fout) throw std::runtime_error("Error writing index: " + path);
 }
 
-/** SHAME(TALLFUNC) */
+/**
+ * @brief Encode a base file and its graph into a quantized codebook, printing usage on missing arguments.
+ * @param argc argument count
+ * @param argv base.fvecs, graph, out.index, rbq|tbq, bits, then optional levels.bin, degree and seed
+ * @return 0 on success, 1 on a bad argument or an unsupported quantizer
+ */
 int main(int argc, char** argv) {
     if (argc < 6) {
         fprintf(stderr, "Usage: %s <base.fvecs> <graph> <out.index> <rbq|tbq> <bits> [levels.bin] [degree=32] [seed=1]\n",

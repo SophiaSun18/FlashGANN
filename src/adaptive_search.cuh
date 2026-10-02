@@ -3,10 +3,39 @@
 #include "adaptive_search_utils.cuh"
 
 /**
- * @brief Quantizer-pruned beam search.
+ * @brief FlashGANN beam search with exact beam distances and estimate-pruned expansion, launched by gpu_search_adaptive.
+ *
+ * Block b serves query b; theta 1 scans a parent block-wide, larger theta one per warp.
+ * Dynamic shared memory, in order: TOP_K + CANDIDATE ids, their distances, HASH_TABLE,
+ * PARENT_LIST (unused), PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, LUT_BUFFER,
+ * SIGN_LUT_BUFFER (turbop), then a transient region for query transforms or radix scratch.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
+ * @param K results per query
+ * @param nq number of queries; blocks past nq exit
+ * @param dim raw dimension
+ * @param beam_sz beam size
+ * @param bitlen visited hash table bit length
+ * @param max_degree graph degree
+ * @param npoints number of indexed points; neighbor ids at or above it are skipped
+ * @param d_queries queries, nq x dim floats
+ * @param d_qg_data index rows, each holding the raw vector, codes, signs, factors and neighbor ids
+ * @param d_qg_signs sign vector of the index rotation
+ * @param d_qg_sketch TurboQuant sketch, three padded_dim vectors, read only when turbop
+ * @param d_qg_levels TurboQuant MSE-stage levels, read only when turbop
+ * @param d_results result ids, nq x K, padded with MAX_INDEX
+ * @param d_result_dists result distances, nq x K, padded with FLT_MAX
+ * @param d_iters receives the iteration count per query
+ * @param entry_point start node
+ * @param row_offset row stride of d_qg_data in floats
+ * @param neighbor_offset offset of the neighbor ids within a row
+ * @param code_offset offset of the neighbor codes within a row
+ * @param sign_offset offset of the neighbor sign codes within a row
+ * @param factor_offset offset of the neighbor factors within a row
+ * @param max_iter_by_beam iteration cap, set by the driver to (beam_sz * 11 + 9) / 10
+ * @param phase2_rho rho of phase 2, from compute_max_rho_bound
+ * @param use_ip whether distances are inner product rather than L2
  */
 template <int CODEBITS, bool turbop>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
@@ -29,7 +58,7 @@ void QuantizedPrunedBeamSearch(
     if (candidate_collect_capacity > candidate_buffer_size) candidate_collect_capacity = candidate_buffer_size;
     const uint32_t padded_beam_size = effective_sort_beam_size(beam_sz);
 
-    // initialize the shared memory
+    // [1] lay out dynamic shared memory
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = reinterpret_cast<INDEX_T*>(shared_memory);
     INDEX_T* TOP_K_INDEX = ALL_INDEX;
@@ -53,8 +82,6 @@ void QuantizedPrunedBeamSearch(
         SIGN_LUT_BUFFER = reinterpret_cast<uint8_t*>(allocate_shared_tail_array<uint4>(tail_base, quant_lutbytes(padded_dim, 1) >> 4));
     }
 
-    // the rotated and sketch queries live only through query preparation, the radix scratch only
-    // through a merge, so both share one region
     char* transient = reinterpret_cast<char*>(allocate_shared_tail_array<uint4>(tail_base, 0));
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(transient);
     float* SKETCH_QUERY_BUFFER = turbop ? ROTATED_QUERY_BUFFER + padded_dim : nullptr;
@@ -74,7 +101,7 @@ void QuantizedPrunedBeamSearch(
     __shared__ uint32_t shared_kth_near_count;
     __shared__ uint32_t warp_stat_counts[2 * WARPS_PER_BLOCK + 1];
 
-    // initialize the query and search state
+    // [2] initialize the query factors and the policy state
     if (tidx() == 0) {
         qf.rotated_query = ROTATED_QUERY_BUFFER;
         qf.lut = LUT_BUFFER;
@@ -100,10 +127,8 @@ void QuantizedPrunedBeamSearch(
         compact_candidate_count = 0;
     }
 
-    // initialize the hash table
+    // [3] clear the visited table, copy the query, and clear the beam, candidate and parent buffers
     hashtable_init(HASH_TABLE, bitlen);
-
-    // initialize shared memory buffers for query, top-k, and candidate lists
     for (int i = tidx(); i < dim; i += blockDim.x) {
         QUERY_BUFFER[i] = query[i];
     }
@@ -121,7 +146,7 @@ void QuantizedPrunedBeamSearch(
     }
     __syncthreads();
 
-    // only the first slot in candidate list is actually initialized with valid entry point
+    // [4] warp 0 seeds candidate slot 0 with the entry point and its exact distance
     if (warpidx() == 0) {
         DISTANCE_T entry_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(entry_point) * row_offset, use_ip);
         if (laneidx() == 0) {
@@ -132,11 +157,10 @@ void QuantizedPrunedBeamSearch(
         }
     }
 
-    // query preparation, quantize the query and prepare the scan LUT for fast neighbor estimation
+    // [5] prepare the query LUTs; the sketch takes the rotated query, the space the builder encodes in
     if constexpr (turbop) {
         turboq_prepare_lut_gpu<CODEBITS>(QUERY_BUFFER, qf, d_qg_signs, d_qg_levels, dim, padded_dim);
         __syncthreads();
-        // the sketch consumes the rotated query, matching the space the builder encodes in
         sketch_apply(qf.rotated_query, qb.rotated_query, d_qg_sketch, d_qg_sketch + padded_dim,
                      d_qg_sketch + 2 * padded_dim, padded_dim, padded_dim);
         lut_build<1>(qb, nullptr, padded_dim);
@@ -147,7 +171,7 @@ void QuantizedPrunedBeamSearch(
     }
     __syncthreads();
 
-    // loop end condition: either entire topK expanded, or reach max iteration
+    // [6] iterate until no parent is left, or max_iter_by_beam or MAX_ITERATIONS is reached
     int iter = 0;
     for (; iter < MAX_ITERATIONS; iter++) {
 
@@ -155,12 +179,12 @@ void QuantizedPrunedBeamSearch(
             break;
         }
 
-        // sort and merge existing candidates into the beam
+        // [7] sort and merge the candidates into the beam
         dispatch_beam_management(
             ALL_INDEX, ALL_DISTANCE, CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, (iter == 0));
         __syncthreads();
 
-        // clear the beam stall part and candidate buffer to avoid stale entries
+        // [8] clear the beam tail past beam_sz and the candidate buffer
         for (uint32_t i = beam_sz + tidx(); i < padded_beam_size; i += blockDim.x) {
             TOP_K_INDEX[i] = MAX_INDEX;
             TOP_K_DISTANCE[i] = FLT_MAX;
@@ -170,8 +194,7 @@ void QuantizedPrunedBeamSearch(
             CANDIDATE_DISTANCE[i] = FLT_MAX;
         }
 
-        // warp 0 updates the adaptive parameters and selects expanders, while the other warps periodically reset
-        // the hash table; the barrier before expansion publishes both
+        // [9] warp 0 updates the policy and picks parents; the other warps periodically reset the visited table
         if (warpidx() == 0) {
             if (laneidx() == 0) {
                 compact_candidate_count = 0;
@@ -217,7 +240,7 @@ void QuantizedPrunedBeamSearch(
             break;
         }
 
-        // use shared-memory pruning for one expander, or warp-local pruning for multiple expanders
+        // [10] expand: block-wide for one parent, one warp per parent otherwise, one or two neighbors per lane
         const bool use_local_gate = adaptive_state.adaptive_spec_degree > 1;
         if (!use_local_gate) {
             collect_phase1_candidates_block_scan<CODEBITS, turbop>(
@@ -230,7 +253,6 @@ void QuantizedPrunedBeamSearch(
         } else {
             const uint32_t parent_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
 
-            // one warp per parent: one neighbor per lane up to 32 neighbors, two per lane up to 64
             if (parent_work_count <= WARP_SIZE) {
                 collect_phase2_degree32_candidates_warp_local<CODEBITS, turbop>(
                     padded_dim, max_degree, npoints, &qf, &qb, d_qg_data,
@@ -254,7 +276,7 @@ void QuantizedPrunedBeamSearch(
             }
             __syncthreads();
 
-            // compute exact distances for compacted speculative candidates
+            // [11] one warp per compacted child computes its exact distance
             for (int i = warpidx(); i < static_cast<int>(compact_candidate_count); i += WARPS_PER_BLOCK) {
                 const INDEX_T child_id = CANDIDATE_INDEX[i];
                 DISTANCE_T child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
@@ -267,15 +289,15 @@ void QuantizedPrunedBeamSearch(
         __syncthreads();
     }
 
-    // merge the final candidate batch into the beam
+    // [12] merge the final candidates into the beam
     dispatch_beam_management(
         ALL_INDEX, ALL_DISTANCE, CANDIDATE_RADIX_SCRATCH, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
+    // [13] clear the visited table and reuse it to write the first K distinct beam ids, padding the rest
     hashtable_init(HASH_TABLE, bitlen);
     __syncthreads();
 
-    // write top-k results
     if (tidx() == 0) {
         int output_count = 0;
         for (int i = 0; i < beam_sz && output_count < K; ++i) {

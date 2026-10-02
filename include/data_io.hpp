@@ -11,13 +11,28 @@
 #include <string>
 #include <vector>
 
+/**
+ * @brief Row-major vectors read by load_fvecs or load_ivecs.
+ * @tparam T element type
+ */
 template <typename T>
 struct LoadedVectors {
-    size_t count = 0;
-    int dim = 0;
-    std::vector<T> values;
+    size_t count = 0;        // number of rows
+    int dim = 0;             // values per row
+    std::vector<T> values;   // count x dim row-major values
 };
 
+/**
+ * @brief Read a .fvecs-style file, each row an int32 dimension followed by that many T values.
+ *
+ * main.cu loads queries and FlashGANN/RaBitQ base data with it. The row count comes from the
+ * file size and the first row's dimension; the process exits when the file cannot be opened.
+ *
+ * @tparam T element type
+ * @param filename input path
+ * @param label name printed in the load message
+ * @return the loaded rows
+ */
 template <typename T>
 LoadedVectors<T> load_fvecs(const std::string& filename, const char* label) {
     std::ifstream f(filename, std::ios::binary);
@@ -49,6 +64,15 @@ LoadedVectors<T> load_fvecs(const std::string& filename, const char* label) {
     return vectors;
 }
 
+/**
+ * @brief Read a .ivecs file, each row an int32 dimension followed by that many int32 values.
+ *
+ * main.cu loads the ground truth with it; behavior otherwise matches load_fvecs.
+ *
+ * @param filename input path
+ * @param label name printed in the load message
+ * @return the loaded rows
+ */
 inline LoadedVectors<int> load_ivecs(const std::string& filename, const char* label) {
     std::ifstream f(filename, std::ios::binary);
     if (!f.is_open()) {
@@ -79,7 +103,18 @@ inline LoadedVectors<int> load_ivecs(const std::string& filename, const char* la
     return vectors;
 }
 
-// Binary graph/signbit I/O ported from beam_search_collab/include/utils.h.
+/**
+ * @brief Read a .bin matrix: int32 row count, int32 row width, then the row-major T payload.
+ *
+ * Ported from beam_search_collab. Loads PathW/CAGRA graphs and PathW signbit files. The buffer
+ * is 64- or 32-byte aligned when the row size allows, so free it with release_bin_buffer.
+ *
+ * @tparam T element type
+ * @param filename input path
+ * @param n_out receives the row count
+ * @param d_out receives the row width
+ * @return the allocated payload; throws on open failure, bad header or size mismatch
+ */
 template <typename T = float>
 T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
     std::ifstream input(filename, std::ios::binary);
@@ -107,7 +142,6 @@ T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
         data = new T[total];
     if (!data) throw std::bad_alloc();
     input.read(reinterpret_cast<char*>(data), sizeof(T) * total);
-    //for (size_t i = 0; i < num; i++) in.read((char*)(data+i*dim), sizeof(T)*dim);
     if (!input) throw std::runtime_error("Error reading bin vector data");
     n_out = size_t(num);
     d_out = size_t(dim);
@@ -115,6 +149,12 @@ T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
     return data;
 }
 
+/**
+ * @brief Free a read_bin buffer with the deallocator matching its allocation.
+ * @tparam T element type
+ * @param ptr buffer from read_bin, or nullptr
+ * @param row_dim row width that read_bin returned in d_out
+ */
 template <typename T>
 void release_bin_buffer(T* ptr, size_t row_dim) {
     if (ptr == nullptr) return;

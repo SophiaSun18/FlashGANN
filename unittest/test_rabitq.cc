@@ -46,7 +46,7 @@ static int unpack(const uint8_t* packed, int bits, size_t dim) {
  * @return the gain-scaled sum bits * (2 * sum(q * c / span) - sum(q))
  */
 static double replay(const std::vector<double>& vec, const uint8_t* packed, int bits, size_t dim,
-                     double* width, double* low) { // SHAME(MANYARG)
+                     double* width, double* low) {
     double lo = vec[0], hi = vec[0];
     for (double x : vec) lo = std::min(lo, x), hi = std::max(hi, x);
     *low = lo;

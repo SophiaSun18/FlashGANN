@@ -15,10 +15,11 @@
 #include "quant.hpp"
 
 /**
- * @brief Pack per-dimension codes of one neighbor into the 4-bit scan group layout.
+ * @brief Pack per-dimension codes of one neighbor into the 4-bit scan group layout, for encode_rbq and encode_tbq.
  *
- * Group gi covers dimensions [gi*g, gi*g+g) and occupies one nibble, most significant
- * dimension first, matching fastscan_decode_code_for_neighbor_seq_lut_gpu.
+ * Group gi holds quant_group(bits) consecutive dimensions, first dimension in the high bits,
+ * in the low nibble of byte gi / 2 when gi is even and the high nibble when odd. This is the
+ * contiguous layout fastscan_decode_code_for_neighbor_seq_lut_gpu reads at 32 layout lanes.
  *
  * @param paddim padded dimension
  * @param bits bits per dimension
@@ -42,10 +43,14 @@ inline void pack_codes(size_t paddim, int bits, const uint8_t* codes, uint8_t* p
 }
 
 /**
- * @brief Read a reconstruction level table emitted from the TurboQuant codebooks.
+ * @brief Read the TurboQuant MSE stage level table from a level file, for tools/buildindex.cc.
+ *
+ * Throws std::runtime_error when the file cannot be opened, its bit width differs from bits,
+ * its count differs from 2^bits, or it is truncated.
+ *
  * @param path binary file of int32 bits, int32 count, then count floats
  * @param bits expected bits per dimension
- * @param levels destination table of 2^bits ascending levels
+ * @param levels destination, resized to 2^bits levels
  */
 inline void read_levels(const std::string& path, int bits, std::vector<float>& levels) {
     std::ifstream fin(path, std::ios::binary);
@@ -64,10 +69,10 @@ inline void read_levels(const std::string& path, int bits, std::vector<float>& l
 }
 
 /**
- * @brief Quantize one coordinate against an ascending level table.
+ * @brief Quantize one coordinate to its nearest level, the TurboQuant MSE stage of encode_tbq.
  *
- * Binary searches the 2^bits - 1 midpoints separating adjacent levels, so the cost is
- * logarithmic in the table size rather than linear.
+ * Binary searches the levels.size() - 1 midpoints between adjacent levels; a value equal to a
+ * midpoint takes the upper level.
  *
  * @param levels ascending reconstruction levels
  * @param value coordinate of a unit-norm rotated residual
@@ -88,11 +93,11 @@ inline uint8_t quantize_level(const std::vector<float>& levels, float value) {
 }
 
 /**
- * @brief Pick the signed uniform grid code whose direction lies closest to a unit vector.
+ * @brief Pick the signed uniform grid code closest in direction to a unit vector, for encode_rbq.
  *
- * Code c reconstructs to 2c - (2^bits - 1), an odd integer, so the sign rides in the code
- * and the magnitude cell m maps to 2m + 1. Sweeps every scale at which a magnitude cell
- * crosses, the Extended RaBitQ search, and keeps the cell set of highest cosine.
+ * Code c reconstructs to the odd integer 2c - (2^bits - 1), carrying the sign; magnitude cell m
+ * maps to 2m + 1. The Extended RaBitQ sweep visits every scale where a magnitude moves up a cell
+ * and keeps the cell set of highest cosine.
  *
  * @param paddim padded dimension
  * @param bits bits per dimension

@@ -13,22 +13,41 @@
 
 #include "distance.hpp"
 
+/** @brief Vertex ID type of shard-local and merged search results. */
 typedef uint32_t vidType;
 
+/** @brief Bit width of the quantized query that the FlashGANN and RaBitQ lookup tables use. */
 #define QG_BQUERY 6
 
+/**
+ * @brief Slots of one shard's elapsed-time block, in seconds, filled by each search driver.
+ *
+ * main.cu gives every shard QG_SHARD_TIMER_COUNT consecutive entries of its elapsed array.
+ */
 inline constexpr int QG_TIMER_QUERY_TRANSFER = 0;
 inline constexpr int QG_TIMER_SEARCH = 1;
 inline constexpr int QG_TIMER_RESULT_COPY = 2;
 inline constexpr int QG_SHARD_TIMER_COUNT = 3;
 
+/** @brief One benchmark row that append_run_stats_to_csv writes. */
 struct RunStats {
-    double runtime = 0.0;
-    double latency = 0.0;
-    double throughput = 0.0;
-    double recall = 0.0;
+    double runtime = 0.0;       // max shard search time, seconds
+    double latency = 0.0;       // milliseconds per query
+    double throughput = 0.0;    // queries per second
+    double recall = 0.0;        // recall@K, percent
 };
 
+/**
+ * @brief Pick the node closest to the data centroid as the search entry point.
+ *
+ * The FlashGANN and RaBitQ drivers call it when the codebook stores no entry point (UINT32_MAX).
+ *
+ * @param data first row of the node data
+ * @param npoints number of rows
+ * @param dim number of vector coordinates read per row
+ * @param row_offset row stride in floats
+ * @return index of the row with the smallest compute_distance to the centroid
+ */
 inline vidType compute_rabitq_entry_point(const float *data, size_t npoints, size_t dim, size_t row_offset) {
     std::vector<float> centroid(dim, 0.0f);
     const float inv_npoints = 1.0f / static_cast<float>(npoints);
@@ -52,6 +71,19 @@ inline vidType compute_rabitq_entry_point(const float *data, size_t npoints, siz
     return best;
 }
 
+/**
+ * @brief Compute recall of row-major top-k results against ground truth.
+ *
+ * Each predicted ID that appears among the first min(topk, gt_k) ground-truth IDs counts, duplicates included.
+ *
+ * @tparam T predicted ID type
+ * @param predicted nq x topk predicted IDs
+ * @param groundtruth nq x gt_k ground-truth IDs
+ * @param nq number of queries
+ * @param topk predicted IDs per query
+ * @param gt_k ground-truth IDs per query
+ * @return matched count divided by nq * topk
+ */
 template <typename T>
 float compute_recall(const T *predicted, const int *groundtruth, size_t nq, int topk, int gt_k) {
     size_t correct = 0;
@@ -71,6 +103,19 @@ float compute_recall(const T *predicted, const int *groundtruth, size_t nq, int 
     return float(correct) / (nq * topk);
 }
 
+/**
+ * @brief Compute recall like compute_recall, counting each distinct predicted ID once per query.
+ *
+ * main.cu reports this recall for the merged shard results.
+ *
+ * @tparam T predicted ID type
+ * @param predicted nq x topk predicted IDs
+ * @param groundtruth nq x gt_k ground-truth IDs
+ * @param nq number of queries
+ * @param topk predicted IDs per query
+ * @param gt_k ground-truth IDs per query
+ * @return matched count divided by nq * topk
+ */
 template <typename T>
 float compute_recall_dedup(const T *predicted, const int *groundtruth, size_t nq, int topk, int gt_k) {
     size_t correct = 0;
@@ -95,7 +140,13 @@ float compute_recall_dedup(const T *predicted, const int *groundtruth, size_t nq
     return float(correct) / (nq * topk);
 }
 
-
+/**
+ * @brief Append one result row to a CSV file, writing the header when the file is new.
+ * @param filename CSV path
+ * @param k top-K of the run
+ * @param beam beam size of the run
+ * @param stats measured runtime, latency, throughput and recall
+ */
 inline void append_run_stats_to_csv(const std::string &filename, int k, int beam, const RunStats &stats) {
     bool file_exists = std::filesystem::exists(filename);
 

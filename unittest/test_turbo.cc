@@ -50,7 +50,7 @@ static int unpack(const uint8_t* packed, int bits, size_t dim) {
  * @return the gain-scaled sum 2 * sum(q * level) - sum(q)
  */
 static double replay(const std::vector<double>& vec, const uint8_t* packed, int bits,
-                     const std::vector<float>* norm, size_t dim, double* width, double* low) { // SHAME(MANYARG)
+                     const std::vector<float>* norm, size_t dim, double* width, double* low) {
     double lo = vec[0], hi = vec[0];
     for (double x : vec) lo = std::min(lo, x), hi = std::max(hi, x);
     *low = lo;
@@ -73,7 +73,7 @@ static double replay(const std::vector<double>& vec, const uint8_t* packed, int 
  * @param resid receives the MSE stage remainder
  * @return estimated squared distance from the query to the neighbor
  */
-static double estimate(const TurboCase& tc, uint32_t seed, std::vector<float>& resid) { // SHAME(TALLFUNC)
+static double estimate(const TurboCase& tc, uint32_t seed, std::vector<float>& resid) {
     const size_t dim = tc.paddim;
     const int stage = quant_stage(tc.codebit);
     const BuildSpec spec{1, dim, dim, 1, tc.codebit, QUANT_TBQ};

@@ -4,46 +4,97 @@
 #include "include/hash_table.cuh"
 #include "include/beam_management.cuh"
 
+/** @brief Threads per PathW block: one warp per block, one block per query, matching the upstream PathWeaver. */
 static constexpr unsigned PATHW_BLOCK_SIZE = 32;
 static_assert(PATHW_BLOCK_SIZE == 32, "PathW and its beam primitives require one warp per block");
 
+/*-------------------------------------------- graph --------------------------------------------*/
+
+/** @brief Expanders per iteration. */
 static constexpr unsigned SEARCH_WIDTH = 1;
+/** @brief Lanes that compute one exact distance together. */
 static constexpr unsigned TEAM_SIZE = 8;
+/** @brief Beam ID bit that pick_expanders sets on an expanded node. */
 static constexpr uint32_t INDEX_MSB_1_MASK = 0x80000000u;
 
+/**
+ * @brief Device copy of a fixed-degree adjacency list for the PathW kernel.
+ *
+ * Kernels take it by value, so it has no destructor; the owner calls release() once.
+ */
 class GraphGPU {
 protected:
   vidType nv;           // number of vertices
-  vidType maxDeg;       // maximun degree
-  vidType *d_edges;
+  vidType maxDeg;       // maximum degree
+  vidType *d_edges;     // device adjacency, nv * maxDeg IDs
 public:
+  /**
+   * @brief Allocate d_edges and copy the host adjacency to it.
+   * @param n number of vertices
+   * @param d maximum degree
+   * @param h_edges host adjacency, n * d IDs
+   */
   GraphGPU(int n, int d, vidType *h_edges) : nv(n), maxDeg(d) {
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_edges, static_cast<size_t>(n) * d * sizeof(vidType)));
     CUDA_SAFE_CALL(cudaMemcpy(d_edges, h_edges, static_cast<size_t>(n) * d * sizeof(vidType), cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
   }
+  /** @brief Free d_edges; safe to call twice. */
   void release() {
     if (d_edges != nullptr) {
       CUDA_SAFE_CALL(cudaFree(d_edges));
       d_edges = nullptr;
     }
   }
+  /** @brief Return the vertex count. */
   inline __device__ __host__ vidType V() { return nv; }
+  /** @brief Return the maximum degree. */
   inline __device__ __host__ vidType get_max_degree() { return maxDeg; }
+  /**
+   * @brief Return the device neighbor list of a vertex.
+   * @param vid vertex ID
+   * @return pointer to maxDeg neighbor IDs
+   */
   inline __device__ __host__ vidType* N(vidType vid) { return d_edges + static_cast<size_t>(vid) * maxDeg; }
 };
 
-/** @brief Shared layout: query, beam/candidate IDs and distances, hash, query signs. */
+/**
+ * @brief Dynamic shared memory bytes of one PathWBeamSearch block, computed by gpu_search_pathw.cu.
+ *
+ * Covers, in kernel order: query, beam plus candidate IDs, their distances, visited hash,
+ * parent list, query sign words and the expander count.
+ *
+ * @param dim vector dimension
+ * @param beam beam size
+ * @param degree graph degree
+ * @param bits visited hash bit length
+ * @return byte count
+ */
 static __host__ inline size_t pathw_shared(unsigned dim, unsigned beam, unsigned degree, unsigned bits) {
     const size_t slots = effective_sort_beam_size(beam) + round_up_power2_u32(degree);
     return dim * sizeof(float) + slots * (sizeof(INDEX_T) + sizeof(float)) +
            hashtable_getsize(bits) * sizeof(INDEX_T) + ((dim + 31) / 32) * sizeof(uint32_t) + 2 * sizeof(uint32_t);
 }
 
-// L2 preload threshold; larger dimensions use the streaming loop below.
+/*-------------------------------------------- distance --------------------------------------------*/
+/** @brief Largest dimension that pathw_l2_distance preloads into registers; larger ones stream. */
 static constexpr unsigned PATHW_L2_PRELOAD_DIM = 128;
 
-/** @brief Original beam_search_collab eight-lane exact-distance helpers. */
+/**
+ * @brief Squared L2 distance from the query to one data row, computed by a team of lanes.
+ *
+ * Ported from beam_search_collab. Lane threadIdx.x % TEAM_SIZE reads 4-float chunks strided by
+ * the team, preloaded into registers when dim is a multiple of 4 up to PATHW_L2_PRELOAD_DIM; an
+ * xor-shuffle reduces within the team. All 32 lanes of the warp must call it.
+ *
+ * @tparam TEAM_SIZE lanes per distance
+ * @param dim vector dimension
+ * @param d_dataset_ptr row-major device data
+ * @param query_ptr query vector
+ * @param child_id data row to compare
+ * @param valid_child false makes the lane contribute 0
+ * @return the team's distance, in every lane of the team
+ */
 template<uint32_t TEAM_SIZE>
 __device__ DISTANCE_T pathw_l2_distance(
     uint32_t dim,
@@ -52,7 +103,7 @@ __device__ DISTANCE_T pathw_l2_distance(
     INDEX_T child_id,
     bool valid_child) {
     unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-    constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte
+    constexpr unsigned vlen = 16 / sizeof(DATA_T);
     unsigned int full_mask = 0xffffffff;
     DISTANCE_T norm2 = 0;
     if (valid_child) {
@@ -121,6 +172,17 @@ __device__ DISTANCE_T pathw_l2_distance(
     return norm2;
 }
 
+/**
+ * @brief Team-cooperative exact distance: pathw_l2_distance, or negated inner product when use_ip.
+ * @tparam TEAM_SIZE lanes per distance
+ * @param dim vector dimension
+ * @param d_dataset_ptr row-major device data
+ * @param query_ptr query vector
+ * @param child_id data row to compare
+ * @param valid_child false makes the lane contribute 0
+ * @param use_ip true for negated inner product, false for squared L2
+ * @return the team's distance, in every lane of the team
+ */
 template<uint32_t TEAM_SIZE>
 __device__ DISTANCE_T pathw_distance(
     uint32_t dim,
@@ -148,6 +210,18 @@ __device__ DISTANCE_T pathw_distance(
     return -dot;
 }
 
+/*-------------------------------------------- candidates --------------------------------------------*/
+/**
+ * @brief Warp sort of a candidate buffer into descending score order.
+ *
+ * Lane l holds entries l + 32 * i in registers; after warp_sort it writes them back reversed.
+ * Asserts when CANDIDATE_BUFFER_SIZE is 0 or above N_1 * 32.
+ *
+ * @tparam N_1 entries per lane
+ * @param candidate_indices candidate IDs, permuted with the scores
+ * @param candidate_distances candidate scores
+ * @param CANDIDATE_BUFFER_SIZE number of entries
+ */
 template <unsigned N_1>
 __device__ void pathw_inverse
 (
@@ -165,7 +239,7 @@ __device__ void pathw_inverse
     DISTANCE_T key_1[N_1];
     INDEX_T val_1[N_1];
 
-    /* Candidates -> Reg */
+    // [1] candidates to registers, padded with FLT_MAX
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = lane_id + (32 * i);
@@ -180,10 +254,10 @@ __device__ void pathw_inverse
             val_1[i] = MAX_INDEX;
         }
     }
-    /* Sort */
+    // [2] ascending warp sort
     warp_sort<float, uint32_t, N_1>(key_1, val_1);
     __syncwarp();
-    /* Reg -> Temp_itopk */
+    // [3] registers back to the buffer in reverse order
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = CANDIDATE_BUFFER_SIZE - 1 - ( (N_1 * lane_id) + i );
@@ -194,12 +268,31 @@ __device__ void pathw_inverse
     }
 }
 
+/**
+ * @brief Sort a candidate buffer by descending score with the pathw_inverse width that fits capacity.
+ * @param ids candidate IDs
+ * @param scores candidate scores
+ * @param capacity number of entries, at most 256
+ */
 static __device__ inline void pathw_sort(INDEX_T* ids, float* scores, unsigned capacity) {
     if (capacity <= 64) pathw_inverse<2>(ids, scores, capacity);
     else if (capacity <= 128) pathw_inverse<4>(ids, scores, capacity);
     else pathw_inverse<8>(ids, scores, capacity);
 }
 
+/**
+ * @brief Pack the signs of query minus parent into 32-bit words, first dimension in the high bit.
+ *
+ * Only warp 0 works; other warps return at once. Lane l writes words l, l + 32, and so on; a bit
+ * is set when query exceeds parent.
+ *
+ * @tparam T vector element type
+ * @param dim vector dimension
+ * @param query query vector
+ * @param parent parent node vector
+ * @param query_sign_bits packed_dim output words
+ * @param packed_dim number of 32-bit words
+ */
 template <typename T>
 __device__ inline void pathw_build_query_sign_bits(int dim, const T* __restrict__ query, const T* __restrict__ parent,
                                                    uint32_t* __restrict__ query_sign_bits, uint32_t packed_dim) {
@@ -220,6 +313,35 @@ __device__ inline void pathw_build_query_sign_bits(int dim, const T* __restrict_
     }
 }
 
+/**
+ * @brief Fill the candidate buffer from the expanders' neighbors, keeping only the best sign-bit matches for exact distance.
+ *
+ * Thread i fills candidate slot i (parent i / graph_degree); a TEAM_WIDTH-lane team computes each
+ * exact distance. It skips children already in the beam and does not use the visited hash. Pruned
+ * slots keep their IDs with distance FLT_MAX.
+ *
+ * @tparam T vector element type
+ * @tparam TEAM_WIDTH lanes per exact distance
+ * @param dim vector dimension
+ * @param parent_list beam slots of the expanders
+ * @param internal_topk_list beam IDs, expanded flag in the high bit
+ * @param candidate_indices candidate ID buffer
+ * @param candidate_distances candidate distance buffer
+ * @param query query vector
+ * @param data row-major device data
+ * @param sign_bits per-node neighbor sign words, sign_bit_vector_size per node
+ * @param query_sign_bits scratch of packed_dim words per expander
+ * @param gg device graph
+ * @param num_expanders number of expanders in parent_list
+ * @param graph_degree neighbors per node
+ * @param candidate_work_count slots that map to an expander neighbor
+ * @param candidate_buffer_size candidate buffer length
+ * @param sign_bit_vector_size sign words per node, graph_degree * packed_dim
+ * @param packed_dim sign words per vector
+ * @param prune_ratio fraction of num_expanders * graph_degree candidates to keep
+ * @param runtime_internal_topk beam slots checked for duplicates
+ * @param use_ip true for negated inner product, false for squared L2
+ */
 template <typename T, uint32_t TEAM_WIDTH>
 __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     int dim,
@@ -241,6 +363,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     float prune_ratio,
     uint32_t runtime_internal_topk,
     bool use_ip) {
+    // [1] query sign words against each expander
     for (uint32_t parent_idx = 0; parent_idx < num_expanders; ++parent_idx) {
         const INDEX_T parent_slot = parent_list[parent_idx];
         const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
@@ -250,6 +373,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
         __syncthreads();
     }
 
+    // [2] gather children not in the beam, scored by minus the sign-word Hamming distance
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
         const bool in_work_range = i < candidate_work_count;
         const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
@@ -268,7 +392,6 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
         if (!valid_child) child_id = MAX_INDEX;
 
         DISTANCE_T score = -FLT_MAX;
-        // load the precomputed sign bits of the child, and compute the matching score
         if (valid_child) {
             int direction = 0;
             const uint32_t* parent_query_sign = query_sign_bits + static_cast<size_t>(parent_idx) * packed_dim;
@@ -284,10 +407,12 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     }
     __syncthreads();
 
+    // [3] sort by descending score
     pathw_sort(
         candidate_indices, candidate_distances, candidate_buffer_size);
     __syncthreads();
 
+    // [4] keep count from prune_ratio, clamped to [1, candidate_buffer_size]
     const uint32_t active_candidate_count = num_expanders * graph_degree;
     int keep_count = static_cast<int>(static_cast<float>(active_candidate_count) * prune_ratio);
     if (keep_count < 1) keep_count = 1;
@@ -295,7 +420,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
         keep_count = static_cast<int>(candidate_buffer_size);
     }
 
-    // Match upstream: prune distances while retaining candidate IDs.
+    // [5] as upstream, set pruned distances to FLT_MAX and keep their IDs
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
         if (i >= static_cast<uint32_t>(keep_count)) {
             candidate_distances[i] = FLT_MAX;
@@ -304,7 +429,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     }
     __syncthreads();
 
-    // compute the exact distances for the kept candidates
+    // [6] exact distances of the kept candidates, work padded to whole warps for the shuffles
     const uint32_t distance_work_count = static_cast<uint32_t>(keep_count) * TEAM_WIDTH;
     const uint32_t padded_work_count = ((distance_work_count + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     for (uint32_t work = threadIdx.x; work < padded_work_count; work += blockDim.x) {
@@ -320,6 +445,30 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     }
 }
 
+/**
+ * @brief Fill the candidate buffer from the expanders' neighbors not yet in the visited hash, with exact distances.
+ *
+ * Thread i fills candidate slot i (parent i / graph_degree) and inserts its child into the hash;
+ * a TEAM_WIDTH-lane team computes each exact distance. Rejected slots get MAX_INDEX and FLT_MAX.
+ *
+ * @tparam T vector element type
+ * @tparam TEAM_WIDTH lanes per exact distance
+ * @param dim vector dimension
+ * @param parent_list beam slots of the expanders
+ * @param internal_topk_list beam IDs, expanded flag in the high bit
+ * @param candidate_indices candidate ID buffer
+ * @param candidate_distances candidate distance buffer
+ * @param query query vector
+ * @param data row-major device data
+ * @param visited_hash visited hash table
+ * @param bitlen visited hash bit length
+ * @param gg device graph
+ * @param num_expanders number of expanders in parent_list
+ * @param graph_degree neighbors per node
+ * @param candidate_work_count slots that map to an expander neighbor
+ * @param candidate_buffer_size candidate buffer length
+ * @param use_ip true for negated inner product, false for squared L2
+ */
 template <typename T, uint32_t TEAM_WIDTH>
 __device__ __forceinline__ void pathw_compute_candidates_plain(
     int dim,
@@ -337,7 +486,7 @@ __device__ __forceinline__ void pathw_compute_candidates_plain(
     uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
     bool use_ip) {
-    // initialize the candidate buffer and filter out the visited ones
+    // [1] gather children and drop the visited ones
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
         const bool in_work_range = i < candidate_work_count;
         const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
@@ -363,7 +512,7 @@ __device__ __forceinline__ void pathw_compute_candidates_plain(
     }
     __syncthreads();
 
-    // compute the exact distances for the candidates that are not filtered out
+    // [2] exact distances of the remaining candidates, work padded to whole warps for the shuffles
     const uint32_t distance_work_count = candidate_buffer_size * TEAM_WIDTH;
     const uint32_t padded_work_count = ((distance_work_count + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     for (uint32_t work = threadIdx.x; work < padded_work_count; work += blockDim.x) {
