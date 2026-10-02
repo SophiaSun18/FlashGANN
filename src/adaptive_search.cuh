@@ -7,8 +7,8 @@
  *
  * Block b serves query b; theta 1 scans a parent block-wide, larger theta one per warp.
  * Dynamic shared memory, in order: TOP_K + CANDIDATE ids, their distances, HASH_TABLE,
- * PARENT_LIST (unused), PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, LUT_BUFFER,
- * SIGN_LUT_BUFFER (turbop), then a transient region for query transforms or radix scratch.
+ * PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, LUT_BUFFER, SIGN_LUT_BUFFER (turbop),
+ * then a transient region for query transforms or radix scratch.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
@@ -70,8 +70,7 @@ void QuantizedPrunedBeamSearch(
     DISTANCE_T* CANDIDATE_DISTANCE = ALL_DISTANCE + padded_beam_size;
 
     INDEX_T* HASH_TABLE = reinterpret_cast<INDEX_T*>(ALL_DISTANCE + result_buffer_size);
-    INDEX_T* PARENT_LIST = HASH_TABLE + hashtable_getsize(bitlen);
-    INDEX_T* PARENT_NODE_LIST = PARENT_LIST + SEARCH_WIDTH;
+    INDEX_T* PARENT_NODE_LIST = HASH_TABLE + hashtable_getsize(bitlen);
     DISTANCE_T* PARENT_DISTANCE_LIST = reinterpret_cast<DISTANCE_T*>(PARENT_NODE_LIST + SEARCH_WIDTH);
     DATA_T* QUERY_BUFFER = reinterpret_cast<DATA_T*>(PARENT_DISTANCE_LIST + SEARCH_WIDTH);
 

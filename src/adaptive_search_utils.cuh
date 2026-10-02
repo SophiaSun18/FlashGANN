@@ -585,7 +585,7 @@ static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t ma
  * @brief Bytes of dynamic shared memory of QuantizedPrunedBeamSearch, used by gpu_search_adaptive for the launch.
  *
  * Covers, in kernel order: TOP_K_INDEX + CANDIDATE_INDEX, TOP_K_DISTANCE + CANDIDATE_DISTANCE, visited
- * hash table, PARENT_LIST, PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, then uint4-aligned
+ * hash table, PARENT_NODE_LIST, PARENT_DISTANCE_LIST, QUERY_BUFFER, then uint4-aligned
  * LUT_BUFFER, SIGN_LUT_BUFFER (TurboQuant only), and one uint4-aligned region holding the larger of
  * the rotated (+ sketch) query and the candidate radix scratch.
  *
@@ -607,7 +607,6 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);
     size += result_buffer_size * sizeof(INDEX_T);
     size += result_buffer_size * sizeof(DISTANCE_T);
-    size += SEARCH_WIDTH * sizeof(INDEX_T);
     size += SEARCH_WIDTH * sizeof(INDEX_T);
     size += SEARCH_WIDTH * sizeof(DISTANCE_T);
     size += dim * sizeof(DATA_T);

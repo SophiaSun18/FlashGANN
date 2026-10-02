@@ -8,7 +8,7 @@
 #endif
 
 /**
- * @brief Parent slots of QuantizedPrunedBeamSearch, the length of PARENT_LIST, PARENT_NODE_LIST and PARENT_DISTANCE_LIST.
+ * @brief Parent slots of QuantizedPrunedBeamSearch, the length of PARENT_NODE_LIST and PARENT_DISTANCE_LIST.
  *
  * pickparents fills up to theta slots, so it must be at least PHASE1_THETA and PHASE2_THETA.
  * rabitq_utils.cuh defines its own value before including this file.
