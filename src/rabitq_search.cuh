@@ -219,10 +219,10 @@ void QuantizedBeamSearch(
         }
         __syncthreads();
 
-        // [11] the expanded parents enter the result pool with their exact distances
-        if (tidx() == 0) {
+        // [11] warp 0 enters the expanded parents into the result pool with their exact distances
+        if (warpidx() == 0) {
             for (int p = 0; p < SEARCH_WIDTH; ++p) {
-                result_pool_push_unique_unsorted(
+                result_pool_push_unsorted(
                     RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, &result_pool_size,
                     &result_pool_worst_idx, &result_pool_worst_dist, K,
                     PARENT_NODE_LIST[p], PARENT_DISTANCE_LIST[p]);
@@ -265,10 +265,12 @@ void QuantizedBeamSearch(
         __syncthreads();
     }
 
-    // [13] sort the result pool, nearest first
-    if (tidx() == 0) {
-        result_pool_sort_small(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size);
-        result_pool_recompute_worst(RESULT_POOL_DISTANCE, result_pool_size, &result_pool_worst_idx, &result_pool_worst_dist);
+    // [13] sort the result pool, nearest first, so its last entry is the worst
+    result_pool_sort(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size);
+    __syncthreads();
+    if (tidx() == 0 && result_pool_size > 0) {
+        result_pool_worst_idx = result_pool_size - 1;
+        result_pool_worst_dist = RESULT_POOL_DISTANCE[result_pool_size - 1];
     }
     __syncthreads();
 
@@ -293,9 +295,9 @@ void QuantizedBeamSearch(
             }
         }
         __syncthreads();
-        if (tidx() == 0) {
+        if (warpidx() == 0) {
             for (int i = 0; i < max_degree; ++i) {
-                result_pool_push_unique_unsorted(
+                result_pool_push_unsorted(
                     RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, &result_pool_size,
                     &result_pool_worst_idx, &result_pool_worst_dist, K,
                     CANDIDATE_INDEX[i], CANDIDATE_DISTANCE[i]);
@@ -304,14 +306,15 @@ void QuantizedBeamSearch(
         __syncthreads();
     }
 
-    // [15] write the sorted result pool, padding the rest
-    if (tidx() == 0) {
-        if (result_pool_size > base_pool_size) result_pool_sort_small(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size);
-        for (int i = 0; i < K; ++i) {
-            const bool filled = i < static_cast<int>(result_pool_size);
-            d_results[query_id * K + i] = filled ? RESULT_POOL_INDEX[i] : MAX_INDEX;
-            d_result_dists[query_id * K + i] = filled ? RESULT_POOL_DISTANCE[i] : FLT_MAX;
-        }
-        d_iters[query_id] = static_cast<uint32_t>(iter);
+    // [15] re-sort a topped-up pool, then thread i writes result slot i, padding the rest
+    if (result_pool_size > base_pool_size) {
+        result_pool_sort(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size);
+        __syncthreads();
     }
+    for (int i = tidx(); i < K; i += blockDim.x) {
+        const bool filled = i < static_cast<int>(result_pool_size);
+        d_results[query_id * K + i] = filled ? RESULT_POOL_INDEX[i] : MAX_INDEX;
+        d_result_dists[query_id * K + i] = filled ? RESULT_POOL_DISTANCE[i] : FLT_MAX;
+    }
+    if (tidx() == 0) d_iters[query_id] = static_cast<uint32_t>(iter);
 }
