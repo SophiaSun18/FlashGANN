@@ -214,7 +214,7 @@ __host__ __device__ inline uint32_t candidate_radix_sort_scratch_alignment() {
 }
 
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
+#if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__ >= 860 && __CUDA_ARCH__ < 900) || __CUDA_ARCH__ >= 1200)
 #define GPU_MAX_WARPS_PER_SM 48
 #else
 #define GPU_MAX_WARPS_PER_SM 64
