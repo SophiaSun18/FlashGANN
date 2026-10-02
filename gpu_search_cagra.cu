@@ -4,8 +4,8 @@
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
-#include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/util/cudart_utils.hpp>
 
 #include <cuda_runtime.h>
 
@@ -48,17 +48,20 @@ void IndexGraph<T>::search_cagra(int nq, const T* queries, int K, vid_t* result_
                              : cuvs::distance::DistanceType::L2Expanded;
 
   // [1] one set of resources per call on the current device, index built from the external graph
+  // copied to device memory first: under HMM, cuVS would otherwise search the host buffers in place
   raft::device_resources res;
   auto stream = raft::resource::get_cuda_stream(res);
   const int64_t npoints = static_cast<int64_t>(this->ntotal);
   const int64_t dim = this->d;
-  auto base_view = raft::make_host_matrix_view<const T, int64_t, raft::row_major>(
-      this->data.data(), npoints, dim);
-  auto graph_view = raft::make_host_matrix_view<const uint32_t, int64_t, raft::row_major>(
-      this->edges.data(), npoints, static_cast<int64_t>(this->maxDeg));
+  const int64_t degree = static_cast<int64_t>(this->maxDeg);
+  auto d_base = raft::make_device_matrix<T, int64_t>(res, npoints, dim);
+  auto d_graph = raft::make_device_matrix<uint32_t, int64_t>(res, npoints, degree);
+  raft::copy(d_base.data_handle(), this->data.data(), npoints * dim, stream);
+  raft::copy(d_graph.data_handle(), this->edges.data(), npoints * degree, stream);
   printf("CAGRA index from external graph: n=%ld, dim=%ld, degree=%d, metric=%s\n",
          npoints, dim, this->maxDeg, use_ip ? "InnerProduct" : "L2Expanded");
-  cuvs::neighbors::cagra::index<T, uint32_t> index(res, metric, base_view, graph_view);
+  cuvs::neighbors::cagra::index<T, uint32_t> index(res, metric, raft::make_const_mdspan(d_base.view()),
+                                                   raft::make_const_mdspan(d_graph.view()));
   raft::resource::sync_stream(res);
 
   // [2] query upload
