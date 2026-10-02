@@ -18,18 +18,19 @@
 #include "include/metric.hpp"
 #include "include/common.hpp"
 #define GPU_SEARCH_MODE_FLASHGANN 1
-#define GPU_SEARCH_MODE_PATHW 2
-#define GPU_SEARCH_MODE_CAGRA 3
+#define GPU_SEARCH_MODE_CAGRA 2
+#define GPU_SEARCH_MODE_PATHW 3
+#define GPU_SEARCH_MODE_RABITQ 4
 
 #ifndef GPU_SEARCH_MODE
 #error "GPU_SEARCH_MODE must be set by the GPU binary build target"
 #endif
 
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW || GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
-#include "include/index.hpp"
-#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
 #include "include/qg.hpp"
 #include "include/quant.hpp"
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA || GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+#include "include/index.hpp"
 #else
 #error "Unknown GPU_SEARCH_MODE"
 #endif
@@ -59,18 +60,20 @@ struct CliConfig {
 
 /** @brief Recognize explicit GPU modes, following beam_search_collab's shared-main convention. */
 static bool is_gpu_mode_arg(const std::string& value) {
-    return value == "gpu_flashgann" || value == "gpu_pathw" || value == "gpu_cagra" ||
-           value == "flashgann" || value == "pathw" || value == "cagra";
+    return value == "gpu_flashgann" || value == "gpu_cagra" || value == "gpu_pathw" || value == "gpu_rabitq" ||
+           value == "flashgann" || value == "cagra" || value == "pathw" || value == "rabitq";
 }
 
 /** @brief Name the search mode linked into this executable. */
 static const char* gpu_search_mode_name() {
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
-    return "gpu_pathw";
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN
+    return "gpu_flashgann";
 #elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
     return "gpu_cagra";
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    return "gpu_pathw";
 #else
-    return "gpu_flashgann";
+    return "gpu_rabitq";
 #endif
 }
 
@@ -112,13 +115,13 @@ static std::vector<std::string> split_file_list(const std::string& files) {
  */
 static void print_usage(const char* prog) {
     const char* mode = gpu_search_mode_name();
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
     fprintf(stderr,
             "Usage: %s [%s] <num_shards> <data1.fvecs[,data2...]> <query.fvecs> <gt.ivecs> "
-            "<graph1.bin[,graph2...]> <signbit1.bin[,signbit2...]> [K=100] [beam_size=128] [degree=graph] "
-            "[-p_ratio keep] [-a_ratio prune] [-csv output.csv] [-iters output.txt] [-repeat n]\n"
-            "Legacy: %s [%s] <data.fvecs> <query.fvecs> <gt.ivecs> <graph.bin> <signbit.bin> "
-            "[K=100] [beam_size=128] [degree=graph] [-p_ratio keep] [-a_ratio prune] "
+            "<qg1.index[,qg2...]> [K=100] [beam_size=128] [degree=32] "
+            "[-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt] [-repeat n]\n"
+            "Legacy: %s [%s] <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> "
+            "[K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] "
             "[-csv output.csv] [-iters output.txt] [-repeat n]\n",
             prog, mode, prog, mode);
 #elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
@@ -131,13 +134,13 @@ static void print_usage(const char* prog) {
             "[K=100] [beam_size=128] [degree=graph] [-width n] [-maxiter n] "
             "[-algo auto|single|multi|kernel] [-csv output.csv] [-iters output.txt] [-repeat n]\n",
             prog, mode, prog, mode);
-#else
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
     fprintf(stderr,
             "Usage: %s [%s] <num_shards> <data1.fvecs[,data2...]> <query.fvecs> <gt.ivecs> "
-            "<qg1.index[,qg2...]> [K=100] [beam_size=128] [degree=32] "
-            "[-quant rbq|tbq] [-bits 1|2|4] [-csv output.csv] [-iters output.txt] [-repeat n]\n"
-            "Legacy: %s [%s] <data.fvecs> <query.fvecs> <gt.ivecs> <qg_codebook> "
-            "[K=100] [beam_size=128] [degree=32] [-quant rbq|tbq] [-bits 1|2|4] "
+            "<graph1.bin[,graph2...]> <signbit1.bin[,signbit2...]> [K=100] [beam_size=128] [degree=graph] "
+            "[-p_ratio keep] [-a_ratio prune] [-csv output.csv] [-iters output.txt] [-repeat n]\n"
+            "Legacy: %s [%s] <data.fvecs> <query.fvecs> <gt.ivecs> <graph.bin> <signbit.bin> "
+            "[K=100] [beam_size=128] [degree=graph] [-p_ratio keep] [-a_ratio prune] "
             "[-csv output.csv] [-iters output.txt] [-repeat n]\n",
             prog, mode, prog, mode);
 #endif
@@ -177,7 +180,19 @@ static bool parse_common_args(int argc, char** argv, int arg_idx, CliConfig& cfg
         } else if (arg == "-repeat" && arg_idx + 1 < argc) {
             cfg.repeat = atoi(argv[++arg_idx]);
             if (cfg.repeat < 1) cfg.repeat = 1;
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
+        } else if (arg == "-quant" && arg_idx + 1 < argc) {
+            g_quant_type = quant_parse(argv[++arg_idx]);
+        } else if (arg == "-bits" && arg_idx + 1 < argc) {
+            cfg.code_bits = atoi(argv[++arg_idx]);
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
+        } else if (arg == "-width" && arg_idx + 1 < argc) {
+            cfg.search_width = atoi(argv[++arg_idx]);
+        } else if (arg == "-maxiter" && arg_idx + 1 < argc) {
+            cfg.max_iterations = atoi(argv[++arg_idx]);
+        } else if (arg == "-algo" && arg_idx + 1 < argc) {
+            cfg.algo = argv[++arg_idx];
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
         } else if ((arg == "-p_ratio" || arg == "-a_ratio") && arg_idx + 1 < argc) {
             char* end = nullptr;
             const char* value = argv[++arg_idx];
@@ -188,18 +203,6 @@ static bool parse_common_args(int argc, char** argv, int arg_idx, CliConfig& cfg
             }
             if (arg == "-p_ratio") cfg.keep_ratio = ratio;
             else cfg.prune_ratio = ratio;
-#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
-        } else if (arg == "-width" && arg_idx + 1 < argc) {
-            cfg.search_width = atoi(argv[++arg_idx]);
-        } else if (arg == "-maxiter" && arg_idx + 1 < argc) {
-            cfg.max_iterations = atoi(argv[++arg_idx]);
-        } else if (arg == "-algo" && arg_idx + 1 < argc) {
-            cfg.algo = argv[++arg_idx];
-#else
-        } else if (arg == "-quant" && arg_idx + 1 < argc) {
-            g_quant_type = quant_parse(argv[++arg_idx]);
-        } else if (arg == "-bits" && arg_idx + 1 < argc) {
-            cfg.code_bits = atoi(argv[++arg_idx]);
 #endif
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -219,7 +222,7 @@ static bool parse_common_args(int argc, char** argv, int arg_idx, CliConfig& cfg
  */
 static bool parse_cli(int argc, char** argv, CliConfig& cfg) {
     constexpr bool pathw = GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW;
-    constexpr bool graphmode = pathw || GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA;
+    constexpr bool graphmode = GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA || pathw;
     constexpr int input_files = pathw ? 5 : 4;
 
     // [1] optional mode word, which must name this binary's mode
@@ -269,7 +272,7 @@ static bool parse_cli(int argc, char** argv, CliConfig& cfg) {
 
 int main(int argc, char** argv) {
     constexpr bool pathw = GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW;
-    constexpr bool graphmode = pathw || GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA;
+    constexpr bool graphmode = GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA || pathw;
     CliConfig cfg;
     try {
         if (!parse_cli(argc, argv, cfg)) {
@@ -301,13 +304,13 @@ int main(int argc, char** argv) {
     printf("Beam size: %d\n", cfg.beam_size);
     if (!graphmode || cfg.degree_explicit) printf("Degree: %d\n", cfg.degree);
     else printf("Degree: from graph header\n");
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
-    printf("PathW ratios: keep %.4f, prune %.4f\n", cfg.keep_ratio, cfg.prune_ratio);
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
+    printf("Quantizer: %s, bits: %d\n", quant_name(g_quant_type), cfg.code_bits);
 #elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
     printf("CAGRA: algo %s, search width %d, max iterations %d\n",
            cfg.algo.c_str(), cfg.search_width, cfg.max_iterations);
-#else
-    printf("Quantizer: %s, bits: %d\n", quant_name(g_quant_type), cfg.code_bits);
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+    printf("PathW ratios: keep %.4f, prune %.4f\n", cfg.keep_ratio, cfg.prune_ratio);
 #endif
     if (!cfg.csv_file.empty()) printf("CSV output: %s\n", cfg.csv_file.c_str());
 
@@ -328,18 +331,22 @@ int main(int argc, char** argv) {
     }
 
     // load every shard's base vectors (and graph); shard ids are offset by the shards before it
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW || GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
-    std::vector<IndexGraph<float>> bases(cfg.total_shards);
-#else
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
     std::vector<LoadedVectors<float>> bases;
     bases.reserve(cfg.total_shards);
+#else
+    std::vector<IndexGraph<float>> bases(cfg.total_shards);
 #endif
     std::vector<size_t> shard_offsets;
     shard_offsets.reserve(cfg.total_shards);
     size_t total_base_count = 0;
     for (int shard = 0; shard < cfg.total_shards; ++shard) {
         shard_offsets.push_back(total_base_count);
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW || GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
+        bases.push_back(load_fvecs<float>(cfg.data_files[shard], "data"));
+        const size_t shard_count = bases.back().count;
+        const int shard_dim = bases.back().dim;
+#else
         try {
             bases[shard].load_graph_index(cfg.codebook_files[shard].c_str());
             bases[shard].load_data(cfg.data_files[shard]);
@@ -355,10 +362,6 @@ int main(int argc, char** argv) {
         }
         const size_t shard_count = bases[shard].ntotal;
         const int shard_dim = bases[shard].d;
-#else
-        bases.push_back(load_fvecs<float>(cfg.data_files[shard], "data"));
-        const size_t shard_count = bases.back().count;
-        const int shard_dim = bases.back().dim;
 #endif
         if (query_dim != shard_dim) {
             fprintf(stderr, "Query dimension %d does not match shard %d data dimension %d\n",
@@ -407,26 +410,33 @@ int main(int argc, char** argv) {
                 throw std::runtime_error(cudaGetErrorString(set_err));
             }
             printf("Shard %d running on GPU %d\n", shard, device_id);
-#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
-            bases[shard].search_pathw(static_cast<int>(nq), queries.data(), cfg.K,
-                                      results.data() + result_base, result_dist.data() + result_base,
-                                      cfg.beam_size, cfg.sign_files[shard].c_str(), cfg.keep_ratio,
-                                      cfg.prune_ratio, elapsed.data() + elapsed_base,
-                                      shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat);
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN || GPU_SEARCH_MODE == GPU_SEARCH_MODE_RABITQ
+            QuantizationGraph qg(bases[shard].count, bases[shard].dim, cfg.degree,
+                                 cfg.codebook_files[shard], g_quant_type, cfg.code_bits);
+            qg.set_metric(g_metric_type);
+#if GPU_SEARCH_MODE == GPU_SEARCH_MODE_FLASHGANN
+            qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), cfg.K,
+                                   results.data() + result_base, result_dist.data() + result_base,
+                                   shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat,
+                                   cfg.beam_size, elapsed.data() + elapsed_base);
+#else
+            qg.gpu_search_rabitq(static_cast<int>(nq), queries.data(), cfg.K,
+                                 results.data() + result_base, result_dist.data() + result_base,
+                                 shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat,
+                                 cfg.beam_size, elapsed.data() + elapsed_base);
+#endif
 #elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_CAGRA
             bases[shard].search_cagra(static_cast<int>(nq), queries.data(), cfg.K,
                                       results.data() + result_base, result_dist.data() + result_base,
                                       cfg.beam_size, cfg.search_width, cfg.max_iterations, cfg.algo,
                                       elapsed.data() + elapsed_base,
                                       shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat);
-#else
-            QuantizationGraph qg(bases[shard].count, bases[shard].dim, cfg.degree,
-                                 cfg.codebook_files[shard], g_quant_type, cfg.code_bits);
-            qg.set_metric(g_metric_type);
-            qg.gpu_search_adaptive(static_cast<int>(nq), queries.data(), cfg.K,
-                                   results.data() + result_base, result_dist.data() + result_base,
-                                   shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat,
-                                   cfg.beam_size, elapsed.data() + elapsed_base);
+#elif GPU_SEARCH_MODE == GPU_SEARCH_MODE_PATHW
+            bases[shard].search_pathw(static_cast<int>(nq), queries.data(), cfg.K,
+                                      results.data() + result_base, result_dist.data() + result_base,
+                                      cfg.beam_size, cfg.sign_files[shard].c_str(), cfg.keep_ratio,
+                                      cfg.prune_ratio, elapsed.data() + elapsed_base,
+                                      shard_iters.data() + static_cast<size_t>(shard) * nq, cfg.repeat);
 #endif
         } catch (const std::exception& e) {
 #pragma omp critical

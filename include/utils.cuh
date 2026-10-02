@@ -130,6 +130,14 @@ __host__ __device__ inline uintptr_t align_up_uintptr(uintptr_t value, uintptr_t
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+template <typename T>
+static __device__ __forceinline__ T* allocate_shared_tail_array(char*& tail_base, uint32_t count) {
+    tail_base = reinterpret_cast<char*>(align_up_uintptr(reinterpret_cast<uintptr_t>(tail_base), alignof(T)));
+    T* ptr = reinterpret_cast<T*>(tail_base);
+    tail_base = reinterpret_cast<char*>(ptr + count);
+    return ptr;
+}
+
 __host__ __device__ inline int clamp_int(int value, int lo, int hi) {
     if (value < lo)
         return lo;

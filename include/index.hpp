@@ -184,14 +184,14 @@ public:
         return gt;
     }
 
+    // cuVS CAGRA search over this graph, implemented in gpu_search_cagra.cu.
+    void search_cagra(int nq, const T* queries, int K, vid_t* result_idx, float* result_dist,
+                      int beam_sz, int search_width, int max_iterations, const std::string& algo,
+                      double* elapsed, uint32_t* iters = nullptr, int repeat = 1);
+
     // GPU PathWeaver-style search, implemented in gpu_search_pathw.cu.
     void search_pathw(int nq, const T* queries, int K, vid_t* result_idx, float* result_dist,
                       int beam_sz, const char* signbit_file, float neighbor_keep_ratio,
                       float iteration_prune_ratio, double* elapsed,
                       uint32_t* iters = nullptr, int repeat = 1);
-
-    // cuVS CAGRA search over this graph, implemented in gpu_search_cagra.cu.
-    void search_cagra(int nq, const T* queries, int K, vid_t* result_idx, float* result_dist,
-                      int beam_sz, int search_width, int max_iterations, const std::string& algo,
-                      double* elapsed, uint32_t* iters = nullptr, int repeat = 1);
 };

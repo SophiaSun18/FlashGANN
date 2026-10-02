@@ -61,7 +61,7 @@ BUILD_HEADERS := \
 
 .PHONY: all clean
 
-all: gpu_flashgann gpu_pathw gpu_cagra buildindex
+all: gpu_flashgann gpu_cagra gpu_pathw gpu_rabitq buildindex
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -70,12 +70,16 @@ gpu_flashgann: main.cu gpu_search_adaptive.cu $(AP_HEADERS) | $(BIN_DIR)
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=1 -o $@ main.cu gpu_search_adaptive.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
-gpu_pathw: main.cu gpu_search_pathw.cu include/index.hpp src/pathw_search.cuh src/pathw_utils.cuh include/utils.cuh include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp include/quant.hpp | $(BIN_DIR)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=2 -o $@ main.cu gpu_search_pathw.cu $(NVLIBS)
+gpu_cagra: main.cu gpu_search_cagra.cu include/index.hpp include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp | $(BIN_DIR)
+	$(CAGRA_NVCC) $(CAGRA_FLAGS) $(CAGRA_INCLUDES) -DGPU_SEARCH_MODE=2 -o $@ main.cu gpu_search_cagra.cu $(CAGRA_LIBS)
 	mv $@ $(BIN_DIR)/
 
-gpu_cagra: main.cu gpu_search_cagra.cu include/index.hpp include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp | $(BIN_DIR)
-	$(CAGRA_NVCC) $(CAGRA_FLAGS) $(CAGRA_INCLUDES) -DGPU_SEARCH_MODE=3 -o $@ main.cu gpu_search_cagra.cu $(CAGRA_LIBS)
+gpu_pathw: main.cu gpu_search_pathw.cu include/index.hpp src/pathw_search.cuh src/pathw_utils.cuh include/utils.cuh include/common.hpp include/data_io.hpp include/distance.hpp include/metric.hpp include/quant.hpp | $(BIN_DIR)
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=3 -o $@ main.cu gpu_search_pathw.cu $(NVLIBS)
+	mv $@ $(BIN_DIR)/
+
+gpu_rabitq: main.cu gpu_search_rabitq.cu include/common.hpp include/distance.hpp include/data_io.hpp include/qg.hpp include/metric.hpp include/quant.hpp include/utils.cuh src/adaptive_search_config.cuh src/rabitq_utils.cuh src/rabitq_search.cuh | $(BIN_DIR)
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -DGPU_SEARCH_MODE=4 -o $@ main.cu gpu_search_rabitq.cu $(NVLIBS)
 	mv $@ $(BIN_DIR)/
 
 buildindex: tools/buildindex.cc $(BUILD_HEADERS) | $(BIN_DIR)
@@ -83,4 +87,4 @@ buildindex: tools/buildindex.cc $(BUILD_HEADERS) | $(BIN_DIR)
 	mv $@ $(BIN_DIR)/
 
 clean:
-	rm -f gpu_flashgann gpu_pathw gpu_cagra buildindex $(BIN_DIR)/gpu_flashgann $(BIN_DIR)/gpu_pathw $(BIN_DIR)/gpu_cagra $(BIN_DIR)/buildindex *.o
+	rm -f gpu_flashgann gpu_cagra gpu_pathw gpu_rabitq buildindex $(BIN_DIR)/gpu_flashgann $(BIN_DIR)/gpu_cagra $(BIN_DIR)/gpu_pathw $(BIN_DIR)/gpu_rabitq $(BIN_DIR)/buildindex *.o

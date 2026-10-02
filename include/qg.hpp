@@ -80,6 +80,8 @@ public:
     void gpu_search_adaptive(int nq, const float* queries, int K, vidType* result_idx,
                              float* result_dist, uint32_t* iters, int repeat, int beam_sz,
                              double* elapsed);
+    void gpu_search_rabitq(int nq, const float* queries, int K, vidType* result_idx, float* result_dist,
+                    uint32_t* iters, int repeat, int beam_sz, double* elapsed);
 
 private:
     void init_layout() {

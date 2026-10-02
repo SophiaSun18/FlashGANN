@@ -138,14 +138,6 @@ static __device__ __forceinline__ int keep_count_for_expander(
     return clamp_int(max_keep, 1, active_count);
 }
 
-template <typename T>
-static __device__ __forceinline__ T* allocate_shared_tail_array(char*& tail_base, uint32_t count) {
-    tail_base = reinterpret_cast<char*>(align_up_uintptr(reinterpret_cast<uintptr_t>(tail_base), alignof(T)));
-    T* ptr = reinterpret_cast<T*>(tail_base);
-    tail_base = reinterpret_cast<char*>(ptr + count);
-    return ptr;
-}
-
 static __host__ __device__ inline uint32_t candidate_buffer_capacity(uint32_t max_degree) {
     const uint32_t max_capacity = static_cast<uint32_t>(THETA_MAX) * max_degree;
     uint32_t capacity = static_cast<uint32_t>(BUFFER_BOUND);
