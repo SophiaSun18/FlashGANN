@@ -452,21 +452,24 @@ static __device__ __forceinline__ uint32_t lutbyte(uint32_t addr) {
 }
 
 /**
- * @brief Sum one neighbor's lookup entries, reading its packed codes 16 bytes at a time.
+ * @brief Sum one lane's share of a neighbor's lookup entries, reading its packed codes 16 bytes at a time.
  *
- * One 16-byte load holds 32 scan groups and replaces 16 byte loads. Only one chunk is live
- * at a time, which bounds the registers it adds.
+ * Group lane g reads 16-byte chunks g, g + LANES, and so on; one load holds 32 scan groups and
+ * replaces 16 byte loads. Only one chunk is live at a time, which bounds the registers it adds.
  *
+ * @tparam LANES lanes cooperating on one neighbor
  * @param lutaddr shared-window address of the query lookup table, 16 entries per scan group
  * @param tile 16-byte aligned packed codes of the neighbor
  * @param num_codebook scan groups of the neighbor, a multiple of 32
- * @return unsigned sum of the looked-up entries
+ * @param group_lane lane within the group
+ * @return this lane's sum of the looked-up entries
  */
-static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8_t *tile, int num_codebook) {
+template <int LANES>
+static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8_t *tile, int num_codebook, int group_lane) {
     const uint4 *chunks = reinterpret_cast<const uint4 *>(tile);
     uint32_t sum = 0;
 #pragma unroll 1
-    for (int base = 0; base < num_codebook; base += 32) {
+    for (int base = group_lane << 5; base < num_codebook; base += LANES << 5) {
         // [1] one load covers scan groups base .. base + 31
         const uint4 chunk = __ldg(chunks + (base >> 5));
         const uint32_t words[4] = {chunk.x, chunk.y, chunk.z, chunk.w};
@@ -486,9 +489,9 @@ static __device__ __forceinline__ uint32_t widesum(uint32_t lutaddr, const uint8
 /**
  * @brief Sum one neighbor's lookup entries across a lane group and apply the sign correction, shared by every estimate.
  *
- * Lanes within a group split the scan groups and reduce; only group lane 0 holds the result.
- * A lone lane on contiguous codes whose tile and bytes_per_neighbor are 16-byte aligned reads
- * them through widesum; that alignment makes num_codebook a multiple of 32.
+ * Lanes split the scan groups and reduce to group lane 0. Contiguous 16-byte aligned codes go
+ * through widesum once every group lane gets a 16-byte chunk: any such code on one lane, 128
+ * bytes or more on 8 lanes.
  *
  * @tparam LANES lanes cooperating on one neighbor
  * @tparam CODEBITS bits per dimension of this code block
@@ -512,15 +515,16 @@ static __device__ __forceinline__ float lut_reduce(
     const uint8_t *tile = lut_tile(code_block, neighbor_idx, bytes_per_neighbor, &in_tile);
 
     bool wide = false;
-    if constexpr (LANES == 1 && GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES == 32) {
-        wide = ((reinterpret_cast<uintptr_t>(tile) | static_cast<uintptr_t>(bytes_per_neighbor)) & 15u) == 0;
+    if constexpr (GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES == 32) {
+        const bool aligned = ((reinterpret_cast<uintptr_t>(tile) | static_cast<uintptr_t>(bytes_per_neighbor)) & 15u) == 0;
+        wide = aligned && num_codebook >= 32 * LANES;
     }
 
     // [2] sum the looked-up entries
     const uint32_t lutaddr = static_cast<uint32_t>(__cvta_generic_to_shared(qf.lut));
     uint32_t raw_sum = 0;
     if (wide) {
-        raw_sum = widesum(lutaddr, tile, num_codebook);
+        raw_sum = widesum<LANES>(lutaddr, tile, num_codebook, group_lane);
     } else {
         for (int cb = group_lane; cb < num_codebook; cb += LANES) {
             const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(tile, cb, in_tile);
