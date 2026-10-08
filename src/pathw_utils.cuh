@@ -16,6 +16,8 @@ static constexpr unsigned SEARCH_WIDTH = 1;
 static constexpr unsigned TEAM_SIZE = 8;
 /** @brief Beam ID bit that pick_expanders sets on an expanded node. */
 static constexpr uint32_t INDEX_MSB_1_MASK = 0x80000000u;
+/** @brief Beam IDs that pathw_inbeam compares per step, read as uint4 shared loads. */
+static constexpr unsigned SCAN_CHUNK = 16;
 
 /**
  * @brief Device copy of a fixed-degree adjacency list for the PathW kernel.
@@ -61,8 +63,9 @@ public:
 /**
  * @brief Dynamic shared memory bytes of one PathWBeamSearch block, computed by gpu_search_pathw.cu.
  *
- * Covers, in kernel order: query, beam plus candidate IDs, their distances, visited hash,
- * parent list, query sign words and the expander count.
+ * Covers, in kernel order: query padded to a multiple of 4 floats so the beam stays 16-byte
+ * aligned, beam plus candidate IDs, their distances, visited hash, parent list, query sign words
+ * and the expander count.
  *
  * @param dim vector dimension
  * @param beam beam size
@@ -71,8 +74,8 @@ public:
  * @return byte count
  */
 static __host__ inline size_t pathw_shared(unsigned dim, unsigned beam, unsigned degree, unsigned bits) {
-    const size_t slots = effective_sort_beam_size(beam) + round_up_power2_u32(degree);
-    return dim * sizeof(float) + slots * (sizeof(INDEX_T) + sizeof(float)) +
+    const size_t slots = effective_sort_beam_size(beam) + degree;
+    return ((dim + 3) & ~3u) * sizeof(float) + slots * (sizeof(INDEX_T) + sizeof(float)) +
            hashtable_getsize(bits) * sizeof(INDEX_T) + ((dim + 31) / 32) * sizeof(uint32_t) + 2 * sizeof(uint32_t);
 }
 
@@ -212,6 +215,40 @@ __device__ DISTANCE_T pathw_distance(
 
 /*-------------------------------------------- candidates --------------------------------------------*/
 /**
+ * @brief Whether child is among the first count beam IDs, ignoring the expanded flag.
+ *
+ * Compares SCAN_CHUNK IDs per step from uint4 loads and stops after the first step with a match;
+ * the count % SCAN_CHUNK tail is scalar. The runtime count keeps beam size out of the template.
+ *
+ * @param child candidate ID
+ * @param beam beam IDs, 16-byte aligned, expanded flag in the high bit
+ * @param count beam IDs to check
+ * @return true when child is in the beam
+ */
+static __device__ __forceinline__ bool pathw_inbeam(INDEX_T child, const INDEX_T* __restrict__ beam, uint32_t count) {
+    // [1] SCAN_CHUNK IDs per step
+    const uint4* chunks = reinterpret_cast<const uint4*>(beam);
+    const uint32_t steps = count / SCAN_CHUNK;
+    for (uint32_t step = 0; step < steps; ++step) {
+        bool hit = false;
+        #pragma unroll
+        for (uint32_t v = 0; v < SCAN_CHUNK / 4; ++v) {
+            const uint4 ids = chunks[step * (SCAN_CHUNK / 4) + v];
+            hit |= (ids.x & ~INDEX_MSB_1_MASK) == child;
+            hit |= (ids.y & ~INDEX_MSB_1_MASK) == child;
+            hit |= (ids.z & ~INDEX_MSB_1_MASK) == child;
+            hit |= (ids.w & ~INDEX_MSB_1_MASK) == child;
+        }
+        if (hit) return true;
+    }
+    // [2] scalar tail
+    for (uint32_t slot = steps * SCAN_CHUNK; slot < count; ++slot) {
+        if ((beam[slot] & ~INDEX_MSB_1_MASK) == child) return true;
+    }
+    return false;
+}
+
+/**
  * @brief Warp sort of a candidate buffer into descending score order.
  *
  * Lane l holds entries l + 32 * i in registers; after warp_sort it writes them back reversed.
@@ -283,8 +320,8 @@ static __device__ inline void pathw_sort(INDEX_T* ids, float* scores, unsigned c
 /**
  * @brief Pack the signs of query minus parent into 32-bit words, first dimension in the high bit.
  *
- * Only warp 0 works; other warps return at once. Lane l writes words l, l + 32, and so on; a bit
- * is set when query exceeds parent.
+ * Only warp 0 works. All lanes compare one word of dimensions together; lane 0 stores the
+ * ballot with its bits reversed. Dimensions past dim contribute zero bits.
  *
  * @tparam T vector element type
  * @param dim vector dimension
@@ -300,23 +337,18 @@ __device__ inline void pathw_build_query_sign_bits(int dim, const T* __restrict_
     const int warp_id = threadIdx.x / WARP_SIZE;
     if (warp_id != 0) return;
 
-    for (uint32_t word = lane_id; word < packed_dim; word += WARP_SIZE) {
-        uint32_t bits = 0;
-        const uint32_t base_dim = word * 32;
-        for (uint32_t bit = 0; bit < 32; ++bit) {
-            const uint32_t d = base_dim + bit;
-            if (d < static_cast<uint32_t>(dim) && query[d] > parent[d]) {
-                bits |= (1u << (31 - bit));
-            }
-        }
-        query_sign_bits[word] = bits;
+    for (uint32_t word = 0; word < packed_dim; ++word) {
+        const uint32_t d = word * WARP_SIZE + lane_id;
+        const bool positive = d < static_cast<uint32_t>(dim) && query[d] > parent[d];
+        const uint32_t bits = __brev(__ballot_sync(0xffffffff, positive));
+        if (lane_id == 0) query_sign_bits[word] = bits;
     }
 }
 
 /**
  * @brief Fill the candidate buffer from the expanders' neighbors, keeping only the best sign-bit matches for exact distance.
  *
- * Thread i fills candidate slot i (parent i / graph_degree); a TEAM_WIDTH-lane team computes each
+ * Thread i fills neighbor slot i of the single parent; a TEAM_WIDTH-lane team computes each
  * exact distance. It skips children already in the beam and does not use the visited hash. Pruned
  * slots keep their IDs with distance FLT_MAX.
  *
@@ -332,9 +364,7 @@ __device__ inline void pathw_build_query_sign_bits(int dim, const T* __restrict_
  * @param sign_bits per-node neighbor sign words, sign_bit_vector_size per node
  * @param query_sign_bits scratch of packed_dim words per expander
  * @param gg device graph
- * @param num_expanders number of expanders in parent_list
  * @param graph_degree neighbors per node
- * @param candidate_work_count slots that map to an expander neighbor
  * @param candidate_buffer_size candidate buffer length
  * @param sign_bit_vector_size sign words per node, graph_degree * packed_dim
  * @param packed_dim sign words per vector
@@ -354,48 +384,30 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     const uint32_t* __restrict__ sign_bits,
     uint32_t* __restrict__ query_sign_bits,
     GraphGPU gg,
-    uint32_t num_expanders,
     uint32_t graph_degree,
-    uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
     uint32_t sign_bit_vector_size,
     uint32_t packed_dim,
     float prune_ratio,
     uint32_t runtime_internal_topk,
     bool use_ip) {
-    // [1] query sign words against each expander
-    for (uint32_t parent_idx = 0; parent_idx < num_expanders; ++parent_idx) {
-        const INDEX_T parent_slot = parent_list[parent_idx];
-        const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
-        pathw_build_query_sign_bits<T>(
-            dim, query, data + static_cast<size_t>(current_node) * dim,
-            query_sign_bits + static_cast<size_t>(parent_idx) * packed_dim, packed_dim);
-        __syncthreads();
-    }
+    // [1] query sign words against the single expander
+    const INDEX_T current_node = internal_topk_list[parent_list[0]] & ~INDEX_MSB_1_MASK;
+    pathw_build_query_sign_bits<T>(dim, query, data + static_cast<size_t>(current_node) * dim,
+                                    query_sign_bits, packed_dim);
+    __syncthreads();
 
-    // [2] gather children not in the beam, scored by minus the sign-word Hamming distance
-    for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
-        const bool in_work_range = i < candidate_work_count;
-        const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
-        const uint32_t neighbor_idx = in_work_range ? i - parent_idx * graph_degree : 0;
-        const bool active_parent = in_work_range && parent_idx < num_expanders;
-        INDEX_T current_node = MAX_INDEX;
-        INDEX_T child_id = MAX_INDEX;
-        if (active_parent) {
-            const INDEX_T parent_slot = parent_list[parent_idx];
-            current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
-            child_id = gg.N(current_node)[neighbor_idx];
-        }
+    // [2] gather neighbors of the single parent
+    for (uint32_t i = threadIdx.x; i < graph_degree; i += blockDim.x) {
+        INDEX_T child_id = gg.N(current_node)[i];
+        if (pathw_inbeam(child_id, internal_topk_list, runtime_internal_topk)) child_id = MAX_INDEX;
         bool valid_child = child_id != MAX_INDEX && child_id < gg.V();
-        for (unsigned slot = 0; valid_child && slot < runtime_internal_topk; ++slot)
-            valid_child = child_id != (internal_topk_list[slot] & ~INDEX_MSB_1_MASK);
-        if (!valid_child) child_id = MAX_INDEX;
 
         DISTANCE_T score = -FLT_MAX;
         if (valid_child) {
             int direction = 0;
-            const uint32_t* parent_query_sign = query_sign_bits + static_cast<size_t>(parent_idx) * packed_dim;
-            const uint32_t* neighbor_sign = sign_bits + static_cast<size_t>(current_node) * sign_bit_vector_size + static_cast<size_t>(neighbor_idx) * packed_dim;
+            const uint32_t* parent_query_sign = query_sign_bits;
+            const uint32_t* neighbor_sign = sign_bits + static_cast<size_t>(current_node) * sign_bit_vector_size + static_cast<size_t>(i) * packed_dim;
             for (uint32_t word = 0; word < packed_dim; ++word) {
                 direction -= __popc(parent_query_sign[word] ^ neighbor_sign[word]);
             }
@@ -413,8 +425,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     __syncthreads();
 
     // [4] keep count from prune_ratio, clamped to [1, candidate_buffer_size]
-    const uint32_t active_candidate_count = num_expanders * graph_degree;
-    int keep_count = static_cast<int>(static_cast<float>(active_candidate_count) * prune_ratio);
+    int keep_count = static_cast<int>(static_cast<float>(graph_degree) * prune_ratio);
     if (keep_count < 1) keep_count = 1;
     if (keep_count > static_cast<int>(candidate_buffer_size)) {
         keep_count = static_cast<int>(candidate_buffer_size);
@@ -448,7 +459,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
 /**
  * @brief Fill the candidate buffer from the expanders' neighbors not yet in the visited hash, with exact distances.
  *
- * Thread i fills candidate slot i (parent i / graph_degree) and inserts its child into the hash;
+ * Thread i fills neighbor slot i of the single parent and inserts its child into the hash;
  * a TEAM_WIDTH-lane team computes each exact distance. Rejected slots get MAX_INDEX and FLT_MAX.
  *
  * @tparam T vector element type
@@ -463,9 +474,7 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
  * @param visited_hash visited hash table
  * @param bitlen visited hash bit length
  * @param gg device graph
- * @param num_expanders number of expanders in parent_list
  * @param graph_degree neighbors per node
- * @param candidate_work_count slots that map to an expander neighbor
  * @param candidate_buffer_size candidate buffer length
  * @param use_ip true for negated inner product, false for squared L2
  */
@@ -481,22 +490,13 @@ __device__ __forceinline__ void pathw_compute_candidates_plain(
     INDEX_T* __restrict__ visited_hash,
     int bitlen,
     GraphGPU gg,
-    uint32_t num_expanders,
     uint32_t graph_degree,
-    uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
     bool use_ip) {
-    // [1] gather children and drop the visited ones
-    for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
-        const bool in_work_range = i < candidate_work_count;
-        const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
-        const uint32_t neighbor_idx = in_work_range ? i - parent_idx * graph_degree : 0;
-        INDEX_T child_id = MAX_INDEX;
-        if (in_work_range && parent_idx < num_expanders) {
-            const INDEX_T parent_slot = parent_list[parent_idx];
-            const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
-            child_id = gg.N(current_node)[neighbor_idx];
-        }
+    // [1] gather real neighbors of the single parent and drop the visited ones
+    const INDEX_T current_node = internal_topk_list[parent_list[0]] & ~INDEX_MSB_1_MASK;
+    for (uint32_t i = threadIdx.x; i < graph_degree; i += blockDim.x) {
+        INDEX_T child_id = gg.N(current_node)[i];
         if (child_id != MAX_INDEX && child_id < gg.V()) {
             if (hashtable_insert(visited_hash, bitlen, child_id) == 0) {
                 child_id = MAX_INDEX;

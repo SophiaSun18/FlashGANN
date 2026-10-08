@@ -12,12 +12,10 @@
  * distances, visited hash, parent list, query sign words, expander count.
  *
  * @tparam T vector element type
- * @tparam VECTOR_DIM compile-time dimension, 0 to use runtime_dim
- * @tparam BEAM_SIZE compile-time beam size, 0 to use runtime_beam
  * @param K results per query
  * @param nq number of queries
- * @param runtime_dim vector dimension
- * @param runtime_beam beam size and iteration limit
+ * @param dim vector dimension
+ * @param beam_sz beam size and iteration limit
  * @param bitlen visited hash bit length
  * @param npoints number of data rows
  * @param d_queries nq x dim queries
@@ -32,10 +30,10 @@
  * @param iteration_prune_ratio fraction of the iteration limit that uses pruning
  * @param use_ip true for negated inner product, false for squared L2
  */
-template <typename T, int VECTOR_DIM = 0, int BEAM_SIZE = 0>
+template <typename T>
 static __global__ __launch_bounds__(PATHW_BLOCK_SIZE)
 void PathWBeamSearch(
-    int K, int nq, int runtime_dim, int runtime_beam, int bitlen, size_t npoints,
+    int K, int nq, int dim, int beam_sz, int bitlen, size_t npoints,
     const T* __restrict__ d_queries,
     const T* __restrict__ d_data,
     const uint32_t* __restrict__ d_sign_bit,
@@ -45,16 +43,12 @@ void PathWBeamSearch(
     vidType entry_point, GraphGPU gg,
     float neighbor_keep_ratio, float iteration_prune_ratio, bool use_ip)
 {
-    const int dim = VECTOR_DIM == 0 ? runtime_dim : VECTOR_DIM;
-    const int beam_sz = BEAM_SIZE == 0 ? runtime_beam : BEAM_SIZE;
     const int query_id = blockIdx.x;
     if (query_id >= nq || beam_sz <= 0) return;
 
-    const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = effective_sort_beam_size(logical_beam_size);
+    const uint32_t padded_beam_size = effective_sort_beam_size(beam_sz);
     const uint32_t graph_degree = gg.get_max_degree();
-    const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * graph_degree;
-    const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
+    const uint32_t candidate_buffer_size = graph_degree;
     const uint32_t result_buffer_size = padded_beam_size + candidate_buffer_size;
     const uint32_t packed_dim = (dim + 31) / 32;
     const uint32_t sign_bit_vector_size = graph_degree * packed_dim;
@@ -65,9 +59,9 @@ void PathWBeamSearch(
     uint32_t expanded = 0;
 
     // [1] carve shared memory
-    extern __shared__ uint32_t smem[];
+    extern __shared__ __align__(16) uint32_t smem[];
     DATA_T* query_buffer = reinterpret_cast<DATA_T*>(smem);
-    INDEX_T* result_indices_buffer = reinterpret_cast<INDEX_T*>(query_buffer + dim);
+    INDEX_T* result_indices_buffer = reinterpret_cast<INDEX_T*>(query_buffer + ((dim + 3) & ~3));
     DISTANCE_T* result_distances_buffer = reinterpret_cast<DISTANCE_T*>(result_indices_buffer + result_buffer_size);
     INDEX_T* visited_hash_buffer = reinterpret_cast<INDEX_T*>(result_distances_buffer + result_buffer_size);
     INDEX_T* parent_list_buffer = visited_hash_buffer + hashtable_getsize(bitlen);
@@ -97,8 +91,8 @@ void PathWBeamSearch(
     pathw_compute_candidates_plain<T, TEAM_SIZE>(
         dim, parent_list_buffer, result_indices_buffer,
         result_indices_buffer + padded_beam_size, result_distances_buffer + padded_beam_size,
-        query_buffer, d_data, visited_hash_buffer, bitlen, gg, valid_entry ? 1u : 0u,
-        graph_degree, candidate_work_count, candidate_buffer_size, use_ip);
+        query_buffer, d_data, visited_hash_buffer, bitlen, gg, 
+        graph_degree, candidate_buffer_size, use_ip);
     __syncthreads();
     if (tid == 0) result_indices_buffer[0] = MAX_INDEX;
     __syncthreads();
@@ -111,12 +105,12 @@ void PathWBeamSearch(
         }
         __syncthreads();
 
-        // [6] merge candidates into the beam, clear slots past logical_beam_size
+        // [6] merge candidates into the beam, clear slots past beam_sz
         dispatch_beam_management(result_indices_buffer, result_distances_buffer, nullptr,
                                  candidate_buffer_size, padded_beam_size, iter == 0);
         __syncthreads();
 
-        for (uint32_t i = logical_beam_size + tid; i < padded_beam_size; i += blockDim.x) {
+        for (uint32_t i = beam_sz + tid; i < padded_beam_size; i += blockDim.x) {
             result_indices_buffer[i] = MAX_INDEX;
             result_distances_buffer[i] = FLT_MAX;
         }
@@ -130,7 +124,7 @@ void PathWBeamSearch(
         // [8] pick the next unexpanded beam node
         if (tid < WARP_SIZE) {
             const uint32_t picked = pick_expanders(
-                SEARCH_WIDTH, parent_list_buffer, logical_beam_size, result_indices_buffer);
+                SEARCH_WIDTH, parent_list_buffer, beam_sz, result_indices_buffer);
             if (tid == 0) {
                 num_expanders[0] = picked;
             }
@@ -144,7 +138,7 @@ void PathWBeamSearch(
                 visited_hash_buffer,
                 bitlen,
                 result_indices_buffer,
-                logical_beam_size,
+                beam_sz,
                 first_tid);
         }
         __syncthreads();
@@ -163,17 +157,15 @@ void PathWBeamSearch(
                 result_indices_buffer + padded_beam_size,
                 result_distances_buffer + padded_beam_size,
                 query_buffer, d_data, d_sign_bit, query_sign_bits_buffer,
-                gg, num_expanders[0], graph_degree, candidate_work_count,
-                candidate_buffer_size, sign_bit_vector_size, packed_dim,
-                neighbor_keep_ratio, logical_beam_size, use_ip);
+                gg, graph_degree, candidate_buffer_size, sign_bit_vector_size, packed_dim,
+                neighbor_keep_ratio, beam_sz, use_ip);
         } else {
             pathw_compute_candidates_plain<T, TEAM_SIZE>(
                 dim, parent_list_buffer, result_indices_buffer,
                 result_indices_buffer + padded_beam_size,
                 result_distances_buffer + padded_beam_size, query_buffer, d_data,
-                visited_hash_buffer, bitlen, gg, num_expanders[0], graph_degree,
-                candidate_work_count, candidate_buffer_size,
-                use_ip);
+                visited_hash_buffer, bitlen, gg, graph_degree,
+                candidate_buffer_size, use_ip);
         }
         __syncthreads();
     }

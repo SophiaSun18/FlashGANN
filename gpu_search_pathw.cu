@@ -47,20 +47,6 @@ static bool get_gpu_pathw_seed_override(size_t npoints, vid_t& seed_node) {
 }
 
 template <typename T>
-static auto pathw_kernel(int dim, int beam) {
-  using Kernel = decltype(&PathWBeamSearch<T, 0, 0>);
-  Kernel kernel = PathWBeamSearch<T, 0, 0>;
-  if (dim == 128) {
-    if (beam == 64) kernel = PathWBeamSearch<T, 128, 64>;
-    else if (beam == 128) kernel = PathWBeamSearch<T, 128, 128>;
-  } else if (dim == 960) {
-    if (beam == 64) kernel = PathWBeamSearch<T, 960, 64>;
-    else if (beam == 128) kernel = PathWBeamSearch<T, 960, 128>;
-  }
-  return kernel;
-}
-
-template <typename T>
 void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_idx, float* result_dist,
                                  int beam_sz, const char* signbit_file,
                                  float neighbor_keep_ratio,
@@ -79,7 +65,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   if (beam_size <= 0) {
     throw std::runtime_error("GPU PathW requires beam_size > 0");
   }
-  const size_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(max_degree));
+  const size_t candidate_buffer_size = static_cast<uint32_t>(max_degree);
   auto bitlen = hash_bitlen_for_search_workload(padded_beam_size, candidate_buffer_size, SMALL_HASH_RESET_INTERVAL);
 
   printf("Beam search PathW on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, padded_beam_size=%d\n",
@@ -175,7 +161,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, vid_t* result_
   }
 
   uint32_t shm_size = pathw_shared(dim, padded_beam_size, max_degree, bitlen);
-  auto kernel = pathw_kernel<T>(dim, beam_size);
+  auto kernel = PathWBeamSearch<T>;
   int numBlocksPerSM = 0;
   CUDA_SAFE_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shm_size)));
   CUDA_SAFE_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, kernel, num_threads, shm_size));
