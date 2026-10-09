@@ -99,6 +99,7 @@ void QuantizedPrunedBeamSearch(
     __shared__ DISTANCE_T current_kth_cutoff;
     __shared__ uint32_t shared_kth_near_count;
     __shared__ uint32_t warp_stat_counts[2 * WARPS_PER_BLOCK + 1];
+    __shared__ int iter;
 
     // [2] initialize the query factors and the policy state
     if (tidx() == 0) {
@@ -124,6 +125,7 @@ void QuantizedPrunedBeamSearch(
         adaptive_state.last_expander_distance = FLT_MAX;
         adaptive_state.current_expander_distance = FLT_MAX;
         compact_candidate_count = 0;
+        iter = 0;
     }
 
     // [3] clear the visited table, copy the query, and clear the beam, candidate and parent buffers
@@ -170,9 +172,9 @@ void QuantizedPrunedBeamSearch(
     }
     __syncthreads();
 
-    // [6] iterate until no parent is left, or max_iter_by_beam or MAX_ITERATIONS is reached
-    int iter = 0;
-    for (; iter < MAX_ITERATIONS; iter++) {
+    // [6] iterate until no parent is left, or max_iter_by_beam or MAX_ITERATIONS is reached; iter lives in
+    // shared memory so it is not held in a register across the merge, and thread 0 advances it
+    while (iter < MAX_ITERATIONS) {
 
         if (iter >= max_iter_by_beam) {
             break;
@@ -243,12 +245,12 @@ void QuantizedPrunedBeamSearch(
         const bool use_local_gate = adaptive_state.adaptive_spec_degree > 1;
         if (!use_local_gate) {
             collect_phase1_candidates_block_scan<CODEBITS, turbop>(
-                padded_dim, dim, max_degree, npoints, &qf, &qb, d_qg_data, QUERY_BUFFER,
+                padded_dim, max_degree, npoints, &qf, &qb, d_qg_data,
                 row_offset, neighbor_offset, code_offset, sign_offset, factor_offset,
                 HASH_TABLE, bitlen, PARENT_NODE_LIST, PARENT_DISTANCE_LIST,
                 candidate_buffer_size, &adaptive_state, current_kth_cutoff,
                 CANDIDATE_INDEX, CANDIDATE_DISTANCE, CANDIDATE_RADIX_SCRATCH, &shared_kth_near_count,
-                warp_stat_counts, use_ip);
+                &compact_candidate_count, warp_stat_counts);
         } else {
             const uint32_t parent_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
 
@@ -273,17 +275,19 @@ void QuantizedPrunedBeamSearch(
             if (tidx() == 0 && compact_candidate_count > candidate_collect_capacity) {
                 compact_candidate_count = candidate_collect_capacity;
             }
-            __syncthreads();
+        }
+        __syncthreads();
 
-            // [11] one warp per compacted child computes its exact distance
-            for (int i = warpidx(); i < static_cast<int>(compact_candidate_count); i += WARPS_PER_BLOCK) {
-                const INDEX_T child_id = CANDIDATE_INDEX[i];
-                DISTANCE_T child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
-                if (laneidx() == 0) {
-                    CANDIDATE_DISTANCE[i] = child_dist;
-                }
+        // [11] one warp per compacted child of either phase computes its exact distance
+        for (int i = warpidx(); i < static_cast<int>(compact_candidate_count); i += WARPS_PER_BLOCK) {
+            const INDEX_T child_id = CANDIDATE_INDEX[i];
+            DISTANCE_T child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
+            if (laneidx() == 0) {
+                CANDIDATE_DISTANCE[i] = child_dist;
             }
-            __syncthreads();
+        }
+        if (tidx() == 0) {
+            iter++;
         }
         __syncthreads();
     }

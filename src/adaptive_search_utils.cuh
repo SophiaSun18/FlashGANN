@@ -633,19 +633,18 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
  * @brief Phase-1 expansion of QuantizedPrunedBeamSearch, the whole block working on parent_node_list[0].
  *
  * Gathers the unvisited neighbors, estimates and prunes them only when they exceed the keep budget,
- * then inserts the kept children into the visited table and writes their exact distances. Every
- * other candidate slot ends as MAX_INDEX / FLT_MAX. Every thread of the block must call it.
+ * then inserts the kept children into the visited table, one thread per entry, and compacts them
+ * to the front of the candidate buffer with FLT_MAX distances for the kernel's exact-distance pass.
+ * Every other candidate slot ends as MAX_INDEX / FLT_MAX. Every thread of the block must call it.
  *
  * @tparam CODEBITS quantizer code width
  * @tparam turbop whether the index carries a TurboQuant sketch
  * @param padded_dim padded dimension
- * @param dim raw dimension
  * @param max_degree graph degree
  * @param npoints number of indexed points; neighbor ids at or above it are skipped
  * @param qf prepared query factors
  * @param qb prepared sketch query factors, read only when turbop
  * @param d_qg_data index rows
- * @param query query in shared memory, dim values
  * @param row_offset row stride of d_qg_data in floats
  * @param neighbor_offset offset of the neighbor ids within a row
  * @param code_offset offset of the neighbor codes within a row
@@ -662,14 +661,14 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
  * @param candidate_distance candidate distances, rewritten
  * @param candidate_radix_scratch radix sort scratch, used above 256 candidates
  * @param kth_near_count shared scratch receiving the estimates within current_kth_cutoff
- * @param warp_stat_counts shared scratch of WARPS_PER_BLOCK counters
- * @param use_ip whether distances are inner product rather than L2
+ * @param compact_candidate_count shared count of the inserted children, at the front of the candidate buffer
+ * @param warp_stat_counts shared scratch of 2 * WARPS_PER_BLOCK counters
  */
 template <int CODEBITS, bool turbop>
 static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
-    size_t padded_dim, int dim, int max_degree, size_t npoints,
+    size_t padded_dim, int max_degree, size_t npoints,
     const QueryFactors* __restrict__ qf, const QueryFactors* __restrict__ qb,
-    const float* __restrict__ d_qg_data, const DATA_T* __restrict__ query,
+    const float* __restrict__ d_qg_data,
     size_t row_offset, size_t neighbor_offset, size_t code_offset, size_t sign_offset,
     size_t factor_offset,
     INDEX_T* __restrict__ hash_table, int bitlen,
@@ -682,8 +681,8 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
     DISTANCE_T* __restrict__ candidate_distance,
     void* candidate_radix_scratch,
     uint32_t* __restrict__ kth_near_count,
-    uint32_t* __restrict__ warp_stat_counts,
-    bool use_ip)
+    uint32_t* __restrict__ compact_candidate_count,
+    uint32_t* __restrict__ warp_stat_counts)
 {
     const uint32_t candidate_work_count = (static_cast<uint32_t>(max_degree) < candidate_buffer_size) ? static_cast<uint32_t>(max_degree) : candidate_buffer_size;
     const INDEX_T parent_node = parent_node_list[0];
@@ -791,33 +790,42 @@ static __device__ __forceinline__ void collect_phase1_candidates_block_scan(
         __syncthreads();
     }
 
-    // [6] one warp per kept child: lane 0 inserts it, __syncwarp keeps the SHFL broadcasts native
-    const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : effective_keep_count;
-    for (int i = warpidx(); i < admit_scan_count; i += WARPS_PER_BLOCK) {
-        INDEX_T child_id = MAX_INDEX;
-        uint32_t inserted = 0;
-        if (laneidx() == 0) {
-            child_id = candidate_index[i];
-            if (child_id != MAX_INDEX && candidate_distance[i] < FLT_MAX) {
-                inserted = hashtable_insert(hash_table, bitlen, child_id);
-            }
-            if (!inserted) {
-                child_id = MAX_INDEX;
-                candidate_index[i] = MAX_INDEX;
-                candidate_distance[i] = FLT_MAX;
-            }
+    // [6] one thread per entry inserts its kept child; entries past the keep count are already MAX_INDEX
+    INDEX_T child_id = MAX_INDEX;
+    uint32_t inserted = 0;
+    if (tidx() < candidate_buffer_size) {
+        child_id = candidate_index[tidx()];
+        if (child_id != MAX_INDEX && candidate_distance[tidx()] < FLT_MAX) {
+            inserted = hashtable_insert(hash_table, bitlen, child_id);
         }
-        __syncwarp();
-        child_id = SHFL(child_id, 0);
-        inserted = SHFL(inserted, 0);
+    }
+    const uint32_t inserted_mask = __ballot_sync(FULL_MASK, inserted != 0);
+    uint32_t* inserted_counts = warp_stat_counts + WARPS_PER_BLOCK;
+    if (laneidx() == 0) {
+        inserted_counts[warpidx()] = __popc(inserted_mask);
+    }
+    __syncthreads();
 
-        DISTANCE_T child_dist = FLT_MAX;
-        if (inserted) {
-            child_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
-        }
-        if (laneidx() == 0 && inserted) {
-            candidate_distance[i] = child_dist;
-        }
+    // [7] compact the inserted children to the front; every slot lies below the total, so clearing
+    // entries at or past it never overwrites a compacted child
+    uint32_t slot_base = 0;
+    uint32_t inserted_total = 0;
+    for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+        const uint32_t count = inserted_counts[w];
+        slot_base += (w < warpidx()) ? count : 0u;
+        inserted_total += count;
+    }
+    if (inserted) {
+        const uint32_t slot = slot_base + __popc(inserted_mask & ((1u << laneidx()) - 1u));
+        candidate_index[slot] = child_id;
+        candidate_distance[slot] = FLT_MAX;
+    }
+    if (tidx() < candidate_buffer_size && tidx() >= inserted_total) {
+        candidate_index[tidx()] = MAX_INDEX;
+        candidate_distance[tidx()] = FLT_MAX;
+    }
+    if (tidx() == 0) {
+        *compact_candidate_count = inserted_total;
     }
 }
 
